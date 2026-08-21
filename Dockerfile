@@ -50,10 +50,8 @@ RUN mkdir -p data logs \
     && useradd -m appuser \
     && chown -R appuser:appuser /app \
     && chmod +x /entrypoint.sh
-
+    
 COPY docker/supervisord.conf /etc/supervisor/conf.d/app.conf
-
-USER appuser
 
 EXPOSE 8088
 

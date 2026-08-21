@@ -11,6 +11,9 @@ fi
 
 mkdir -p /app/data /app/logs /app/logs/caddy
 
+# Railway Volume 挂载后可能为 root 所有，修正运行时目录权限
+chown -R appuser:appuser /app/data /app/logs
+
 # ── 安全预检 ──────────────────────────────────────────────────────────
 # 设置 H2S_SKIP_PREFLIGHT=1 可跳过（仅限本地/隔离网络部署）
 if [ -z "${H2S_SKIP_PREFLIGHT:-}" ]; then
@@ -49,4 +52,5 @@ if [ -z "${H2S_SKIP_PREFLIGHT:-}" ]; then
 fi
 
 echo "[entrypoint] Preflight OK. Starting FlatRadar..."
-exec "$@"
+exec supervisord -n -c /etc/supervisor/conf.d/app.conf
+
