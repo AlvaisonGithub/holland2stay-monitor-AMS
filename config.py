@@ -20,6 +20,7 @@ users.py 和 web.py 都会 import 本模块中的 dataclass。
 """
 from __future__ import annotations
 
+from asyncio import tasks
 import logging
 import os
 import re
@@ -359,6 +360,11 @@ class AvailabilityFilter:
 @dataclass
 class OurDomainCityFilter:
     """OurDomain / RENTCafe building filter 的单个条目。"""
+    name: str
+    key: str
+
+@dataclass
+class OurCampusCityFilter:
     name: str
     key: str
 
@@ -788,6 +794,7 @@ class Config:
     heartbeat_interval_minutes: int = 60
     sources: list[str] = field(default_factory=lambda: ["holland2stay"])
     ourdomain_cities: list[OurDomainCityFilter] = field(default_factory=list)
+    ourcampus_cities: list[OurCampusCityFilter] = field(default_factory=list)
     xior_cities: list[XiorCityFilter] = field(default_factory=list)
 
     def scrape_tasks_v2(self) -> list["ScrapeTask"]:  # type: ignore[name-defined]
@@ -832,6 +839,16 @@ class Config:
                 for c in self.ourdomain_cities
             )
 
+        if "ourcampus" in self.sources:
+            tasks.extend(
+                ScrapeTask(
+                    source="ourcampus",
+                    city_key=c.key,
+                    city_display=c.name,
+                )
+                for c in self.ourcampus_cities
+            )
+
         if "xior" in self.sources:
             tasks.extend(
                 ScrapeTask(
@@ -870,6 +887,8 @@ def _parse_name_key_list(raw: str, cls: type):
 def _parse_ourdomain_cities(raw: str) -> list[OurDomainCityFilter]:
     return _parse_name_key_list(raw, OurDomainCityFilter)
 
+def _parse_ourcampus_cities(raw: str) -> list[OurCampusCityFilter]:
+    return _parse_name_key_list(raw, OurCampusCityFilter)
 
 def _parse_xior_cities(raw: str) -> list[XiorCityFilter]:
     return _parse_name_key_list(raw, XiorCityFilter)
@@ -930,6 +949,14 @@ def load_config() -> Config:
         raw_od_cities = os.environ.get("OURDOMAIN_CITIES", "Amsterdam Diemen,diemen")
         ourdomain_cities = _parse_ourdomain_cities(raw_od_cities)
 
+    ourcampus_cities: list[OurCampusCityFilter] = []
+    if "ourcampus" in sources:
+        raw_oc_cities = os.environ.get(
+        "OURCAMPUS_CITIES",
+        "OurCampus Amsterdam Diemen,diemen",
+    )
+    ourcampus_cities = _parse_ourcampus_cities(raw_oc_cities)
+
     xior_cities: list[XiorCityFilter] = []
     if "xior" in sources:
         raw_xior_cities = os.environ.get("XIOR_CITIES", "")
@@ -974,5 +1001,6 @@ def load_config() -> Config:
         heartbeat_interval_minutes=max(0, int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES") or "60")),
         sources=sources,
         ourdomain_cities=ourdomain_cities,
+        ourcampus_cities=ourcampus_cities,
         xior_cities=xior_cities,
     )
