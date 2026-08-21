@@ -212,6 +212,11 @@ def user_edit(user_id: str) -> Any:
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(request.url)
+        except Exception as e:
+            logger.exception("保存用户失败 user_id=%s: %s", user_id, e)
+            flash(f"保存用户失败：{type(e).__name__}: {e}", "danger")
+            return redirect(request.url)
+
         # App 密码变化（修改或清除）→ 撤销该用户的所有 Bearer token，
         # 避免泄漏的旧密码继续生效。app_login_enabled 切到 False 同理。
         pw_changed = (updated.app_password_hash != user.app_password_hash)
