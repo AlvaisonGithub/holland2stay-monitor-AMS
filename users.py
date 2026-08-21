@@ -350,13 +350,13 @@ def _row_to_user(row: dict) -> UserConfig:
     if email_password:
         email_password = decrypt(email_password)
     if telegram_token:
-    try:
-        telegram_token = decrypt(telegram_token)
-    except Exception:
-        logger.warning(
+        try:
+            telegram_token = decrypt(telegram_token)
+        except Exception:
+            logger.warning(
             "Telegram token 无法解密，可能 DATA_ENCRYPTION_KEY 已更换；暂时按空值处理"
         )
-        telegram_token = ""
+            telegram_token = ""
 
     if twilio_token:
         twilio_token = decrypt(twilio_token)
