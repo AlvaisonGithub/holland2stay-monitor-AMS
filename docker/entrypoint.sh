@@ -13,6 +13,8 @@ mkdir -p /app/data /app/logs /app/logs/caddy
 
 # Railway Volume 挂载后可能为 root 所有，修正运行时目录权限
 chown -R appuser:appuser /app/data /app/logs
+chown appuser:appuser /app/.env
+
 
 # ── 安全预检 ──────────────────────────────────────────────────────────
 # 设置 H2S_SKIP_PREFLIGHT=1 可跳过（仅限本地/隔离网络部署）

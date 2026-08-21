@@ -141,6 +141,12 @@ def user_new() -> Any:
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(request.url)
+
+        except Exception as e:
+            logger.exception("构建用户表单失败 user_id=%s: %s", user_id, e)
+            flash(f"处理表单失败：{type(e).__name__}: {e}", "danger")
+            return redirect(request.url)
+
         try:
             def _append(users):
                 if any(u.name == user.name for u in users):
@@ -151,6 +157,12 @@ def user_new() -> Any:
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(request.url)
+
+        except Exception as e:
+            logger.exception("构建用户表单失败 user_id=%s: %s", user_id, e)
+            flash(f"处理表单失败：{type(e).__name__}: {e}", "danger")
+            return redirect(request.url)
+
         _log_user_change("创建", user)
         flash(f"✅ 用户「{user.name}」已创建", "success")
         return redirect(url_for("users_list"))
@@ -195,6 +207,12 @@ def user_edit(user_id: str) -> Any:
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(request.url)
+
+        except Exception as e:
+            logger.exception("构建用户表单失败 user_id=%s: %s", user_id, e)
+            flash(f"处理表单失败：{type(e).__name__}: {e}", "danger")
+            return redirect(request.url)
+
         try:
             def _replace(users):
                 current = get_user(users, user_id)
@@ -209,9 +227,11 @@ def user_edit(user_id: str) -> Any:
         except LookupError:
             flash("用户不存在", "danger")
             return redirect(url_for("users_list"))
+
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(request.url)
+
         except Exception as e:
             logger.exception("保存用户失败 user_id=%s: %s", user_id, e)
             flash(f"保存用户失败：{type(e).__name__}: {e}", "danger")
