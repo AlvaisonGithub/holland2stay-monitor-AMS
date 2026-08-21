@@ -6,10 +6,10 @@ from support_text import CONTACT_EMAIL
 
 _dir = Path(__file__).parent
 
-_terms_en = (_dir / "terms.txt").read_text()
-_privacy_en = (_dir / "privacy.txt").read_text()
-_terms_zh = (_dir / "termszh.txt").read_text()
-_privacy_zh = (_dir / "privacyzh.txt").read_text()
+_terms_en = (_dir / "terms.txt").read_text(encoding="utf-8")
+_privacy_en = (_dir / "privacy.txt").read_text(encoding="utf-8")
+_terms_zh = (_dir / "termszh.txt").read_text(encoding="utf-8")
+_privacy_zh = (_dir / "privacyzh.txt").read_text(encoding="utf-8")
 
 UPDATED_AT = "2026-05-26"
 
