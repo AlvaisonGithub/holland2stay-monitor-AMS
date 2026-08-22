@@ -35,7 +35,7 @@ class TestSettingsPost:
         """POST 写入 CHECK_INTERVAL=120 应生效。"""
         r = admin_client.post("/settings", data={
             "CHECK_INTERVAL": "120",
-            "city_selected": "Eindhoven,29",
+            "city_selected": "Amsterdam,24",
         }, headers={"X-CSRF-Token": "test_csrf"})
         # 验证 .env 文件内容被写入
         assert r.status_code in (200, 302)
@@ -53,7 +53,7 @@ class TestSettingsPost:
             "PEAK_WEEKDAYS_ONLY": "false",
             "JITTER_RATIO": "0.15",
             "LOG_LEVEL": "DEBUG",
-            "city_selected": "Eindhoven,29|Amsterdam,24",
+            "city_selected": "Amsterdam,24|Amsterdam,24",
         }, headers={"X-CSRF-Token": "test_csrf"})
         assert r.status_code in (200, 302)
         env_content = isolated_data_dir.joinpath(".env").read_text(encoding="utf-8")
@@ -63,20 +63,20 @@ class TestSettingsPost:
         assert "PEAK_END=09:30" in env_content
         assert "LOG_LEVEL=DEBUG" in env_content
         # CITIES 应为 | 拼接格式
-        assert "Eindhoven,29|Amsterdam,24" in env_content
+        assert "Amsterdam,24|Amsterdam,24" in env_content
 
     def test_save_sources_h2s_and_ourdomain(self, admin_client, isolated_data_dir):
         r = admin_client.post("/settings", data={
             "CHECK_INTERVAL": "300",
             "LOG_LEVEL": "INFO",
             "source_selected": ["holland2stay", "ourdomain"],
-            "city_selected": ["Eindhoven,29"],
+            "city_selected": ["Amsterdam,24"],
             "ourdomain_city_selected": ["Amsterdam Diemen,diemen"],
         }, headers={"X-CSRF-Token": "test_csrf"})
         assert r.status_code in (200, 302)
         env_content = isolated_data_dir.joinpath(".env").read_text(encoding="utf-8")
         assert "SOURCES=holland2stay,ourdomain" in env_content
-        assert "CITIES=Eindhoven,29" in env_content
+        assert "CITIES=Amsterdam,24" in env_content
         assert "OURDOMAIN_CITIES=Amsterdam Diemen,diemen" in env_content
 
     def test_save_sources_ourdomain_only(self, admin_client, isolated_data_dir):
@@ -84,7 +84,7 @@ class TestSettingsPost:
             "CHECK_INTERVAL": "300",
             "LOG_LEVEL": "INFO",
             "source_selected": ["ourdomain"],
-            "city_selected": ["Eindhoven,29"],
+            "city_selected": ["Amsterdam,24"],
             "ourdomain_city_selected": ["Amsterdam Diemen,diemen"],
         }, headers={"X-CSRF-Token": "test_csrf"})
         assert r.status_code in (200, 302)
@@ -95,7 +95,7 @@ class TestSettingsPost:
         r = admin_client.post("/settings", data={
             "CHECK_INTERVAL": "300",
             "LOG_LEVEL": "INFO",
-            "city_selected": ["Eindhoven,29"],
+            "city_selected": ["Amsterdam,24"],
         }, headers={"X-CSRF-Token": "test_csrf"})
         assert r.status_code in (200, 302)
         env_content = isolated_data_dir.joinpath(".env").read_text(encoding="utf-8")
@@ -110,7 +110,7 @@ class TestSettingsPost:
             "PEAK_INTERVAL": "abc",
             "HEARTBEAT_INTERVAL_MINUTES": "",
             "LOG_LEVEL": "INFO",
-            "city_selected": "Eindhoven,29",
+            "city_selected": "Amsterdam,24",
         }, headers={"X-CSRF-Token": "test_csrf"})
         assert r.status_code in (200, 302)
         env_content = env_path.read_text(encoding="utf-8")

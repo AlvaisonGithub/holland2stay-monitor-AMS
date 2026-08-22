@@ -27,7 +27,7 @@ class TestScrapeTasksV2:
 
     def test_ourdomain_source_adds_ourdomain_tasks(self, monkeypatch):
         monkeypatch.setenv("SOURCES", "holland2stay,ourdomain")
-        monkeypatch.setenv("CITIES", "Eindhoven,29")
+        monkeypatch.setenv("CITIES", "Amsterdam,24")
         monkeypatch.setenv("OURDOMAIN_CITIES", "Amsterdam Diemen,diemen")
 
         cfg = config.load_config()
