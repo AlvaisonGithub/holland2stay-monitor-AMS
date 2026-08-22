@@ -959,8 +959,8 @@ def load_config() -> Config:
         raw_oc_cities = os.environ.get(
         "OURCAMPUS_CITIES",
         "OurCampus Amsterdam Diemen,diemen",
-    )
-    ourcampus_cities = _parse_ourcampus_cities(raw_oc_cities)
+        )
+        ourcampus_cities = _parse_ourcampus_cities(raw_oc_cities)
 
     xior_cities: list[XiorCityFilter] = []
     if "xior" in sources:
