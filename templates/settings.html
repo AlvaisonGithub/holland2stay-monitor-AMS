@@ -118,6 +118,13 @@
           OD · OurDomain
         </label>
         <label class="checkbox" style="white-space:nowrap;">
+          <input type="checkbox"
+                name="source_selected"
+                value="ourcampus"
+                {% if 'ourcampus' in selected_sources %}checked{% endif %}>
+          OC · OurCampus
+        </label>
+        <label class="checkbox" style="white-space:nowrap;">
           <input type="checkbox" name="source_selected" value="xior" {% if 'xior' in selected_sources %}checked{% endif %}>
           XR · Xior
         </label>
@@ -130,7 +137,7 @@
   <div class="card mb-4">
     <div class="section-header">
       <i class="bi bi-geo-alt mr-2" style="color:var(--success);"></i>{{ _('settings_h2s_cities') }}
-      <button type="button" class="btn btn-ghost btn-sm" onclick="var cbs=this.parentElement.nextElementSibling.querySelectorAll('input[type=checkbox]');var all=Array.from(cbs).every(c=>c.checked);cbs.forEach(c=>c.checked=!all);this.textContent=all?'{{ _('select_all') }}':'{{ _('deselect_all') }}'" style="margin-left:auto;">{{ _('select_all') }}</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-select-all="{{ _('select_all') }}" data-deselect-all="{{ _('deselect_all') }}" onclick="var cbs=this.parentElement.nextElementSibling.querySelectorAll('input[type=checkbox]');var all=Array.from(cbs).every(c=>c.checked);cbs.forEach(c=>c.checked=!all);if(all){this.textContent=this.dataset.selectAll}else{this.textContent=this.dataset.deselectAll}" style="margin-left:auto;">{{ _('select_all') }}</button>
     </div>
     <div class="card-body">
       <div class="form-row" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));">
@@ -167,7 +174,7 @@
   <div class="card mb-4">
     <div class="section-header">
       <i class="bi bi-building mr-2" style="color:var(--accent);"></i>{{ _('settings_xior_cities') }}
-      <button type="button" class="btn btn-ghost btn-sm" onclick="var cbs=this.parentElement.parentElement.querySelectorAll('.xior-bldg input[type=checkbox]');var all=Array.from(cbs).every(c=>c.checked);cbs.forEach(c=>c.checked=!all);this.textContent=all?'{{ _('select_all') }}':'{{ _('deselect_all') }}'" style="margin-left:auto;">{{ _('select_all') }}</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-select-label="{{ _('select_all') }}" data-deselect-label="{{ _('deselect_all') }}" onclick="var cbs=this.parentElement.parentElement.querySelectorAll('.xior-bldg input[type=checkbox]');var all=Array.from(cbs).every(c=&gt;c.checked);cbs.forEach(c=&gt;c.checked=!all);this.textContent=all?this.dataset.selectLabel:this.dataset.deselectLabel" style="margin-left:auto;">{{ _('select_all') }}</button>
     </div>
     <div class="card-body">
       <style>
@@ -198,6 +205,30 @@
         {% endfor %}
       </div>
       <div class="form-help mt-2"><i class="bi bi-info-circle mr-1"></i>{{ _('settings_xior_hint') }}</div>
+    </div>
+  </div>
+
+  <!-- OurCampus buildings -->
+  <div class="card mb-4">
+    <div class="section-header">
+      <i class="bi bi-building mr-2" style="color:var(--accent);"></i>
+      OurCampus Buildings
+    </div>
+
+    <div class="card-body">
+      <div class="form-row" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
+        {% for city in known_ourcampus_cities %}
+        <label class="checkbox" style="white-space:nowrap;">
+          <input
+            type="checkbox"
+            name="ourcampus_city_selected"
+            value="{{ city.name }},{{ city.key }}"
+            {% if city.key in selected_ourcampus_keys %}checked{% endif %}
+          >
+          {{ city.name }}
+        </label>
+        {% endfor %}
+      </div>
     </div>
   </div>
 

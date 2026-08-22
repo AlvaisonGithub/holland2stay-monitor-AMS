@@ -49,7 +49,7 @@ def settings() -> Any:
             ENV_PATH.touch()
 
         selected_sources = request.form.getlist("source_selected")
-        allowed_sources = {"holland2stay", "ourdomain", "xior"}
+        allowed_sources = {"holland2stay", "ourdomain", "ourcampus", "xior"}
         sources = [s for s in selected_sources if s in allowed_sources]
         if not sources:
             sources = ["holland2stay"]
@@ -59,12 +59,20 @@ def settings() -> Any:
 
         # 城市：复选框提交 "CityName,ID" 格式，用 | 拼接
         selected_cities = request.form.getlist("city_selected")
-        cities_val = "|".join(selected_cities) if selected_cities else "Eindhoven,29"
+        cities_val = "|".join(selected_cities) if selected_cities else "Amsterdam,24"
         write_env_key("CITIES", sanitize_dotenv(cities_val))
 
         selected_od_cities = request.form.getlist("ourdomain_city_selected")
         od_cities_val = "|".join(selected_od_cities) if selected_od_cities else "Amsterdam Diemen,diemen"
         write_env_key("OURDOMAIN_CITIES", sanitize_dotenv(od_cities_val))
+
+        selected_oc_cities = request.form.getlist("ourcampus_city_selected")
+        oc_cities_val = (
+            "|".join(selected_oc_cities)
+            if selected_oc_cities
+            else "OurCampus Amsterdam Diemen,diemen"
+        )
+        write_env_key("OURCAMPUS_CITIES", sanitize_dotenv(oc_cities_val))
 
         selected_xr_cities = request.form.getlist("xior_city_selected")
         xr_cities_val = "|".join(selected_xr_cities) if selected_xr_cities else ""
@@ -100,6 +108,8 @@ def settings() -> Any:
             new_values.get("LOG_LEVEL", "?"),
             cities_val,
             od_cities_val,
+            oc_cities_val,
+            xr_cities_val
         )
 
         flash(tr("settings_config_saved", lang), "success")
@@ -116,7 +126,7 @@ def settings() -> Any:
         selected_sources = {"holland2stay"}
 
     selected_city_ids: set[str] = set()
-    for entry in env.get("CITIES", "Eindhoven,29").split("|"):
+    for entry in env.get("CITIES", "Amsterdam,24").split("|"):
         parts = entry.strip().split(",")
         if len(parts) >= 2:
             selected_city_ids.add(parts[-1].strip())
@@ -127,6 +137,16 @@ def settings() -> Any:
         if len(parts) >= 2:
             selected_ourdomain_keys.add(parts[-1].strip())
 
+    selected_ourcampus_keys: set[str] = set()
+    for entry in env.get(
+            "OURCAMPUS_CITIES",
+            "OurCampus Amsterdam Diemen,diemen",
+        ).split("|"):
+        parts = entry.strip().split(",")
+        if len(parts) >= 2:
+            selected_ourcampus_keys.add(parts[-1].strip())
+
+
     selected_xior_keys: set[str] = set()
     raw_xior = env.get("XIOR_CITIES", "")
     if raw_xior:
@@ -135,7 +155,11 @@ def settings() -> Any:
             if len(parts) >= 2:
                 selected_xior_keys.add(parts[-1].strip())
     else:
-        selected_xior_keys = {c["key"] for c in KNOWN_XIOR_CITIES}
+        selected_xior_keys = {
+        c["key"]
+        for c in KNOWN_XIOR_CITIES
+        if c.get("city", "").strip().lower() == "amsterdam"
+    }
 
     xior_by_city: dict[str, list[dict]] = {}
     xior_city_all_checked: dict[str, bool] = {}
@@ -150,11 +174,13 @@ def settings() -> Any:
         known_cities=KNOWN_CITIES,
         known_ourdomain_cities=KNOWN_OURDOMAIN_CITIES,
         known_xior_cities=KNOWN_XIOR_CITIES,
+        known_ourcampus_cities=KNOWN_OURCAMPUS_CITIES,
         xior_by_city=xior_by_city,
         xior_city_all_checked=xior_city_all_checked,
         selected_sources=selected_sources,
         selected_city_ids=selected_city_ids,
         selected_ourdomain_keys=selected_ourdomain_keys,
+        selected_ourcampus_keys=selected_ourcampus_keys,
         selected_xior_keys=selected_xior_keys,
     )
 

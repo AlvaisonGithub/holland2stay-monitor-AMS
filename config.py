@@ -335,6 +335,9 @@ KNOWN_OURDOMAIN_CITIES: list[dict] = [
     {"name": "Amsterdam South-East","key": "south-east"},
 ]
 
+KNOWN_OURCAMPUS_CITIES: list[dict] = [
+    {"name": "OurCampus Amsterdam Diemen", "key": "diemen"},
+]
 
 @dataclass
 class CityFilter:
@@ -902,8 +905,10 @@ def load_config() -> Config:
     --------------
     CHECK_INTERVAL          int，默认 300
     SOURCES                 逗号或 | 分隔，默认 "holland2stay"
-    CITIES                  格式 "城市名,ID|城市名,ID"，默认 "Eindhoven,29"
-    OURDOMAIN_CITIES        格式 "显示名,key|显示名,key"，启用 ourdomain 时默认 Amsterdam Diemen
+    CITIES                  格式 "城市名,ID|城市名,ID"，默认 "Amsterdam,24"
+    OURDOMAIN_CITIES        格式 "显示名,key|显示名,key"，启用 ourdomain 时默认 Amsterdam 
+    OURCAMPUS_CITIES        格式 "显示名,key|显示名,key"，启用 ourcampus 时默认 Amsterdam 
+    XIOR_CITIES             格式 "显示名,key|显示名,key"，启用 xior 时默认 Amsterdam 
     AVAILABILITY_FILTERS    格式 "标签,ID|标签,ID"，默认包含 179 和 336
     DB_PATH                 str，默认 "data/listings.db"
     LOG_LEVEL               str，默认 "INFO"
@@ -927,7 +932,7 @@ def load_config() -> Config:
     sources = _parse_sources(os.environ.get("SOURCES", "holland2stay"))
 
     cities: list[CityFilter] = []
-    raw_cities = os.environ.get("CITIES", "Eindhoven,29")
+    raw_cities = os.environ.get("CITIES", "Amsterdam,24")
     for entry in raw_cities.split("|"):
         parts = entry.strip().rsplit(",", 1)
         if len(parts) == 2:
