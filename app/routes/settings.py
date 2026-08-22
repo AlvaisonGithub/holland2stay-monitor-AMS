@@ -12,7 +12,7 @@ from typing import Any
 from dotenv import dotenv_values
 from flask import Flask, flash, redirect, render_template, request, url_for
 
-from config import ENV_PATH, KNOWN_CITIES, KNOWN_OURDOMAIN_CITIES, KNOWN_XIOR_CITIES
+from config import ENV_PATH, KNOWN_CITIES, KNOWN_OURCAMPUS_CITIES, KNOWN_OURDOMAIN_CITIES, KNOWN_XIOR_CITIES
 
 from app.auth import admin_required
 from app.csrf import csrf_required
