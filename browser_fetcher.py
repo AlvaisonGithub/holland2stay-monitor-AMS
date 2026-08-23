@@ -149,17 +149,45 @@ class BrowserFetcher:
 
         self._raise_if_maintenance_page()
 
-        # 等待 filter UI 出现，确认 CF 挑战完成 + React 已渲染
+        # 等待正常 H2S 页面真正出现。
         try:
             self._page.wait_for_selector(
-                '[data-cy="FilterList-item"]', timeout=25_000
+                '[data-cy="FilterList-item"]',
+                timeout=25_000,
             )
-        except Exception:
-            logger.warning("filter UI 未在预期时间内出现，继续尝试...")
+        except Exception as e:
+            try:
+                title = self._page.title()
+            except Exception:
+                title = ""
+
+            try:
+                url = self._page.url
+            except Exception:
+                url = ""
+
+            try:
+                html = self._page.content()
+            except Exception:
+                html = ""
+
+            logger.warning(
+                "H2S 页面未进入正常状态: title=%r url=%s html=%r",
+                title,
+                url,
+                html[:500],
+            )
+
+            self._initialized = False
+
+            raise _exc("BlockedError")(
+                "H2S 页面未通过 Cloudflare / 正常页面 UI 未出现"
+            ) from e
 
         elapsed = time.monotonic() - start
-        logger.info("CF 挑战完成 (%.1fs)", elapsed)
+        logger.info("H2S 正常页面已加载 (%.1fs)", elapsed)
         self._initialized = True
+
 
     def _raise_if_maintenance_page(self) -> None:
         """浏览器已打开主站时，识别 H2S 维护页并走维护冷却分支。"""
