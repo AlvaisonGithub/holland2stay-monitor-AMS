@@ -2072,8 +2072,8 @@ async def _async_main() -> None:
 def main() -> None:
     # Windows 默认 ProactorEventLoop 与 asyncio.wait_for + Event.wait() 有兼容问题，
     # 切换为 SelectorEventLoop 可避免超时时意外抛出 CancelledError。
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    #if sys.platform == "win32":
+    #    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     try:
         asyncio.run(_async_main())
