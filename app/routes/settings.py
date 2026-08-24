@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from dotenv import dotenv_values
@@ -117,13 +118,26 @@ def settings() -> Any:
 
     env = dict(dotenv_values(str(ENV_PATH)))
 
+
+    # Railway / Docker 注入的真实环境变量优先于 .env 文件
+    for key in (
+        "SOURCES",
+        "CITIES",
+        "OURDOMAIN_CITIES",
+        "OURCAMPUS_CITIES",
+        "XIOR_CITIES",
+    ):
+        if key in os.environ:
+            env[key] = os.environ[key]
+
+
     selected_sources = {
         s.strip().lower()
-        for s in (env.get("SOURCES") or "holland2stay").replace("|", ",").split(",")
+        for s in (env.get("SOURCES") or "ourdomain,xior,ourcampus").replace("|", ",").split(",")
         if s.strip()
     }
     if not selected_sources:
-        selected_sources = {"holland2stay"}
+        selected_sources = {"ourdomain", "xior", "ourcampus"}
 
     selected_city_ids: set[str] = set()
     for entry in env.get("CITIES", "Amsterdam,24").split("|"):
