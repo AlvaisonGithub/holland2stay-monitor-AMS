@@ -557,8 +557,8 @@ async def _broadcast_error(
 
     抓取异常分支里 "for notifier: send_error / if web_notifier: send_error"
     这段重复了三次，抽出来消除重复。"""
-    for _, notifier in user_notifiers:
-        await notifier.send_error(msg)
+    # for _, notifier in user_notifiers:
+    #    await notifier.send_error(msg)
     if web_notifier:
         await web_notifier.send_error(msg)
 
@@ -1793,10 +1793,15 @@ async def main_loop(
             heartbeat_interval_sec = cfg.heartbeat_interval_minutes * 60
             if heartbeat_interval_sec > 0 and time.monotonic() - last_heartbeat_time >= heartbeat_interval_sec:
                 total = storage.count_all()
-                for _, notifier in user_notifiers:
-                    await notifier.send_heartbeat(total_in_db=total, round_count=round_count)
+
+                # Heartbeat 仅用于系统健康状态 / Web 面板，
+                # 不发送到 Telegram / iMessage / WhatsApp 等用户渠道。
                 if web_notifier:
-                    await web_notifier.send_heartbeat(total_in_db=total, round_count=round_count)
+                    await web_notifier.send_heartbeat(
+                        total_in_db=total,
+                        round_count=round_count,
+                    )
+
                 # 清理旧通知，防止 web_notifications 表无限增长
                 pruned = storage.prune_notifications(keep=500)
                 if pruned:
