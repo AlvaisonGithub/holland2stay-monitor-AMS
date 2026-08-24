@@ -24,6 +24,7 @@ from typing import Optional
 
 import curl_cffi.requests as req
 
+from app.routes.api_v1 import listings
 from config import get_impersonate, get_proxy_url
 from models import Listing
 
@@ -219,7 +220,16 @@ class OurDomainScraper(AbstractScraper):
             )
             for unit in all_units.values()
         ]
-        logger.info("[%s] OurDomain 共抓取 %d 个单元", display, len(listings))
+        logger.info(
+            "[%s] %s 抓取完成: fingerprint=%s, attempts=%d/%d, units=%d, complete=%s",
+            display,
+            "OurCampus" if task.source == "ourcampus" else "OurDomain",
+            impersonate,
+            len(tried),
+            len(attempts),
+            len(listings),
+            complete,
+        )
         return ScrapeResult(task=task, listings=listings, complete=complete)
 
     def _scrape_once(
