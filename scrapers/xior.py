@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from threading import Lock
 from typing import Optional
@@ -106,33 +106,33 @@ class XiorScraper(AbstractScraper):
 
         all_units: dict[str, dict] = {}
         complete = True
-        unit_lock = Lock()
+        # unit_lock = Lock()
 
         successful_room_types = 0
         failed_room_types = 0
 
         # max_workers = min(4, len(room_ids))
-        max_workers = 1
 
-        def _fetch_one(room_id: int) -> Optional[dict]:
-            with self._rate_lock:
-                elapsed = time.monotonic() - self._last_request_at
-                if elapsed < 1.5:
-                    time.sleep(1.5 - elapsed)
-                self._last_request_at = time.monotonic()
+        impersonate = get_impersonate()
 
-            with req.Session(impersonate=get_impersonate(), proxies=proxies) as session:
-                return _post_ajax(
+        with req.Session(
+            impersonate=impersonate,
+            proxies=proxies,
+        ) as session:
+            for room_id in room_ids:
+                # 同一 IP / session 的请求保持至少 1.5 秒间隔
+                with self._rate_lock:
+                    elapsed = time.monotonic() - self._last_request_at
+                    if elapsed < 1.5:
+                        time.sleep(1.5 - elapsed)
+                    self._last_request_at = time.monotonic()
+
+                data = _post_ajax(
                     session,
                     property_page_id=prop_id,
                     room_type_id=room_id,
                     semester_id=semester,
                 )
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_fetch_one, rid): rid for rid in room_ids}
-            for future in as_completed(futures):
-                data = future.result()
 
                 if data is None:
                     complete = False
@@ -141,11 +141,11 @@ class XiorScraper(AbstractScraper):
 
                 successful_room_types += 1
 
-                with unit_lock:
-                    for unit in data.get("units", []):
-                        uid = str(unit.get("apartmentId", ""))
-                        if uid and uid not in all_units:
-                            all_units[uid] = unit
+                for unit in data.get("units", []):
+                    uid = str(unit.get("apartmentId", ""))
+                    if uid and uid not in all_units:
+                        all_units[uid] = unit
+
 
 
         today = date.today()
@@ -166,8 +166,10 @@ class XiorScraper(AbstractScraper):
         ]
 
         logger.info(
-            "[%s] Xior 抓取完成: room_types=%d/%d 成功, failed=%d, units=%d, complete=%s",
+            "[%s] Xior 抓取完成: fingerprint=%s, room_types=%d/%d 成功, "
+            "failed=%d, units=%d, complete=%s",
             display,
+            impersonate,
             successful_room_types,
             len(room_ids),
             failed_room_types,
