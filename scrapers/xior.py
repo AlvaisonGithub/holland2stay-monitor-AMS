@@ -107,6 +107,10 @@ class XiorScraper(AbstractScraper):
         all_units: dict[str, dict] = {}
         complete = True
         unit_lock = Lock()
+
+        successful_room_types = 0
+        failed_room_types = 0
+
         max_workers = min(4, len(room_ids))
 
         def _fetch_one(room_id: int) -> Optional[dict]:
@@ -128,14 +132,20 @@ class XiorScraper(AbstractScraper):
             futures = {pool.submit(_fetch_one, rid): rid for rid in room_ids}
             for future in as_completed(futures):
                 data = future.result()
+
                 if data is None:
                     complete = False
+                    failed_room_types += 1
                     continue
+
+                successful_room_types += 1
+
                 with unit_lock:
                     for unit in data.get("units", []):
                         uid = str(unit.get("apartmentId", ""))
                         if uid and uid not in all_units:
                             all_units[uid] = unit
+
 
         today = date.today()
 
@@ -154,7 +164,16 @@ class XiorScraper(AbstractScraper):
             for u in all_units.values()
         ]
 
-        logger.info("[%s] Xior 共抓取 %d 个单元", display, len(listings))
+        logger.info(
+            "[%s] Xior 抓取完成: room_types=%d/%d 成功, failed=%d, units=%d, complete=%s",
+            display,
+            successful_room_types,
+            len(room_ids),
+            failed_room_types,
+            len(listings),
+            complete,
+        )
+
         return ScrapeResult(task=task, listings=listings, complete=complete)
 
     def _verify_bookable_floorplans(
@@ -249,6 +268,30 @@ def _post_ajax(
 
         try:
             resp = session.post(AJAX_URL, data=payload, timeout=30)
+
+            if resp.status_code == 429:
+                # 只有真正的 429 才进入 30/60 秒退避
+                if attempt < len(RATE_LIMIT_BACKOFF):
+                    continue
+                break
+
+            if resp.status_code == 403 and is_cloudflare_body(resp.text):
+                logger.warning(
+                    "Xior AJAX 命中 Cloudflare challenge "
+                    "property=%s room=%s，跳过该 room type",
+                    property_page_id,
+                    room_type_id,
+                )
+                return None
+
+            if not resp.ok:
+                logger.error(
+                    "Xior AJAX HTTP %d attempt=%d body=%r",
+                    resp.status_code,
+                    attempt,
+                    resp.text[:300],
+                )
+                return None
         except Exception as exc:
             logger.error("Xior AJAX 网络异常 attempt=%d: %s", attempt, exc, exc_info=True)
             if attempt < len(RATE_LIMIT_BACKOFF):
