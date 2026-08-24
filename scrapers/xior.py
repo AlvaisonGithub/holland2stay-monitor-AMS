@@ -111,7 +111,8 @@ class XiorScraper(AbstractScraper):
         successful_room_types = 0
         failed_room_types = 0
 
-        max_workers = min(4, len(room_ids))
+        # max_workers = min(4, len(room_ids))
+        max_workers = 1
 
         def _fetch_one(room_id: int) -> Optional[dict]:
             with self._rate_lock:
