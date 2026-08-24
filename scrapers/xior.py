@@ -101,66 +101,100 @@ class XiorScraper(AbstractScraper):
         prop_id = bldg["property_page_id"]
         semester = bldg["semester_id"]
         room_ids = bldg["room_type_ids"]
+
         proxy = get_proxy_url()
         proxies = {"https": proxy, "http": proxy} if proxy else {}
 
+        xior_impersonates = [
+            "safari17_2_ios",
+            "safari18_0",
+            "firefox135",
+            "chrome136",
+        ]
+
         all_units: dict[str, dict] = {}
-        complete = True
-        # unit_lock = Lock()
-
         successful_room_types = 0
-        failed_room_types = 0
+        failed_room_types = len(room_ids)
+        complete = False
+        used_impersonate = xior_impersonates[0]
 
-        # max_workers = min(4, len(room_ids))
+        for idx, impersonate in enumerate(xior_impersonates, start=1):
+            used_impersonate = impersonate
 
-        impersonate = get_impersonate()
+            trial_units: dict[str, dict] = {}
+            trial_success = 0
+            trial_failed = 0
 
-        with req.Session(
-            impersonate=impersonate,
-            proxies=proxies,
-        ) as session:
-            for room_id in room_ids:
-                # 同一 IP / session 的请求保持至少 1.5 秒间隔
-                with self._rate_lock:
-                    elapsed = time.monotonic() - self._last_request_at
-                    if elapsed < 1.5:
-                        time.sleep(1.5 - elapsed)
-                    self._last_request_at = time.monotonic()
+            with req.Session(
+                impersonate=impersonate,
+                proxies=proxies,
+            ) as session:
+                for room_id in room_ids:
+                    with self._rate_lock:
+                        elapsed = time.monotonic() - self._last_request_at
+                        if elapsed < 1.5:
+                            time.sleep(1.5 - elapsed)
+                        self._last_request_at = time.monotonic()
 
-                data = _post_ajax(
-                    session,
-                    property_page_id=prop_id,
-                    room_type_id=room_id,
-                    semester_id=semester,
+                    data = _post_ajax(
+                        session,
+                        property_page_id=prop_id,
+                        room_type_id=room_id,
+                        semester_id=semester,
+                    )
+
+                    if data is None:
+                        trial_failed += 1
+                        continue
+
+                    trial_success += 1
+
+                    for unit in data.get("units", []):
+                        uid = str(unit.get("apartmentId", ""))
+                        if uid and uid not in trial_units:
+                            trial_units[uid] = unit
+
+            # 只要至少有一个 room type 成功，就接受这一轮结果
+            if trial_success > 0:
+                all_units = trial_units
+                successful_room_types = trial_success
+                failed_room_types = trial_failed
+                complete = trial_failed == 0
+                break
+
+            # 0/N 才切 fingerprint
+            if idx < len(xior_impersonates):
+                logger.warning(
+                    "[%s] Xior fingerprint=%s 全部 room type 被 CF 拦截，"
+                    "切换指纹 %d/%d → %s",
+                    display,
+                    impersonate,
+                    idx + 1,
+                    len(xior_impersonates),
+                    xior_impersonates[idx],
                 )
-
-                if data is None:
-                    complete = False
-                    failed_room_types += 1
-                    continue
-
-                successful_room_types += 1
-
-                for unit in data.get("units", []):
-                    uid = str(unit.get("apartmentId", ""))
-                    if uid and uid not in all_units:
-                        all_units[uid] = unit
-
-
+            else:
+                logger.warning(
+                    "[%s] Xior 所有 fingerprint 均未成功",
+                    display,
+                )
 
         today = date.today()
 
-        # floorplans.aspx 权威校验：仅当存在「窗口内的候选可订单元」时才多查一次
-        # 该楼的 floorplans.aspx（绝大多数轮次没有候选 → 零额外请求）。fail-open：
-        # 拿不到（None）就不 gate，信 WP feed，绝不漏报真房源。
         bookable_fp_ids = self._verify_bookable_floorplans(
-            list(all_units.values()), today, proxies, display,
+            list(all_units.values()),
+            today,
+            proxies,
+            display,
         )
 
         listings = [
             _to_listing(
-                u, display=display, building_url=bldg.get("url", ""),
-                today=today, bookable_floorplan_ids=bookable_fp_ids,
+                u,
+                display=display,
+                building_url=bldg.get("url", ""),
+                today=today,
+                bookable_floorplan_ids=bookable_fp_ids,
             )
             for u in all_units.values()
         ]
@@ -169,7 +203,7 @@ class XiorScraper(AbstractScraper):
             "[%s] Xior 抓取完成: fingerprint=%s, room_types=%d/%d 成功, "
             "failed=%d, units=%d, complete=%s",
             display,
-            impersonate,
+            used_impersonate,
             successful_room_types,
             len(room_ids),
             failed_room_types,
@@ -177,7 +211,11 @@ class XiorScraper(AbstractScraper):
             complete,
         )
 
-        return ScrapeResult(task=task, listings=listings, complete=complete)
+        return ScrapeResult(
+            task=task,
+            listings=listings,
+            complete=complete,
+        )
 
     def _verify_bookable_floorplans(
         self,
