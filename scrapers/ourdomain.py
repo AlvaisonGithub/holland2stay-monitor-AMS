@@ -11,9 +11,23 @@ JSON API. The scraper uses a two-step flow:
 Floor-plan level availability is deliberately ignored because it can disagree
 with unit-level rows. Listings are keyed by physical unit ID and prefixed with
 ``od_`` so they cannot collide with Holland2Stay URL slugs.
+
+Cloudflare 403 处理策略（2026-10 修订）
+---------------------------------------
+SecureRC 的 Cloudflare 保护已从 TLS fingerprint 级别升级到 JS challenge 级别，
+curl_cffi 的 TLS impersonation 已无法通过——无论换多少指纹都是 403。
+
+抓取流程改为两阶段：
+1. **快速路径**：curl_cffi 尝试（个别 IP / 指纹仍可能通过，保留快速通道）
+2. **浏览器兜底**：curl_cffi 全指纹失败后，切换到 CloakBrowser（patched
+   Chromium），通过真实浏览器执行 JS challenge 后 fetch HTML
+
+浏览器跨轮复用（与 H2S 同模式）：首轮创建后后续轮复用，避免每轮重新
+执行 CF challenge。仅在进程退出时关闭。
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date
 from html import unescape
 import logging
@@ -24,8 +38,7 @@ from typing import Optional
 
 import curl_cffi.requests as req
 
-from app.routes.api_v1 import listings
-from config import get_impersonate, get_proxy_url
+from config import CLOAKBROWSER_HEADLESS, get_impersonate, get_proxy_url
 from models import Listing
 
 from .base import (
@@ -152,6 +165,75 @@ class OurDomainScraper(AbstractScraper):
         },
     }
 
+    # ── 浏览器生命周期管理 ──────────────────────────────────────────
+    # CloakBrowser 跨轮复用——首轮创建后后续轮复用同一个实例，避免每轮
+    # 重新执行 CF challenge。仅在进程退出或 BlockedError 时关闭重建。
+    _BROWSER_MAX_AGE = 7200  # 2 小时
+
+    def __init__(self) -> None:
+        self._browser_fetcher: Optional["RentCafeBrowserFetcher"] = None
+        self._browser_origin: Optional[str] = None  # 限制同源复用
+        self._browser_created_at: float = 0.0
+
+    def _ensure_browser(self, entry_url: str) -> "RentCafeBrowserFetcher":
+        """懒创建或复用浏览器实例。BlockedError 后自动重建。"""
+        from .rentcafe_browser import RentCafeBrowserFetcher
+        from urllib.parse import urlparse
+
+        parsed = urlparse(entry_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        now = time.monotonic()
+        if self._browser_fetcher is not None:
+            # 超龄 → 主动重建
+            if now - self._browser_created_at > self._BROWSER_MAX_AGE:
+                logger.info("RentCafe browser 已存活 %.0f 分钟，主动重建",
+                            (now - self._browser_created_at) / 60)
+                self._close_browser()
+            # 不同源 → 不能复用（OurDomain Diemen vs South-East vs OurCampus）
+            elif self._browser_origin != origin:
+                logger.info("RentCafe browser 切换 origin: %s → %s",
+                            self._browser_origin, origin)
+                self._close_browser()
+            else:
+                return self._browser_fetcher
+
+        # 新建浏览器
+        self._browser_fetcher = RentCafeBrowserFetcher(headless=CLOAKBROWSER_HEADLESS)
+        try:
+            self._browser_fetcher.ensure_initialized(entry_url)
+            self._browser_origin = origin
+            self._browser_created_at = time.monotonic()
+            logger.info("RentCafe browser 已创建并完成 CF 挑战 (origin=%s)", origin)
+            return self._browser_fetcher
+        except Exception:
+            self._close_browser()
+            raise
+
+    def _close_browser(self) -> None:
+        """关闭浏览器，释放资源。"""
+        if self._browser_fetcher is not None:
+            try:
+                self._browser_fetcher.close()
+            except Exception:
+                pass
+            self._browser_fetcher = None
+            self._browser_origin = None
+
+    @contextmanager
+    def batch_session(self):
+        """
+        批次上下文：确保浏览器存活（如果已创建），dispatcher 通过此入口
+        拿到共享实例。浏览器跨轮复用——不再每批次创建/关闭。
+        """
+        try:
+            yield
+        except (BlockedError,):
+            # CF 会话被标记不可复用：关闭当前浏览器，下轮重建
+            logger.warning("OurDomain 浏览器会话不可复用状态，关闭浏览器")
+            self._close_browser()
+            raise
+
     def scrape(self, task: ScrapeTask) -> ScrapeResult:
         building = self._building_for_task(task)
         slug = building["slug"]
@@ -164,6 +246,10 @@ class OurDomainScraper(AbstractScraper):
         proxies = {"https": proxy, "http": proxy} if proxy else {}
 
         floorplans_url = f"{base}/{slug}/floorplans.aspx"
+
+        # ── 阶段 1：curl_cffi 快速路径 ──────────────────────────────
+        # 个别 IP / 指纹仍可能通过 CF（CF 策略可能因 IP / 时间段不同而放宽），
+        # 保留快速通道避免无谓启动浏览器（~190MB 开销）。
         attempts = _impersonate_attempts()
         tried: list[str] = []
         last_blocked: BlockedError | None = None
@@ -182,6 +268,7 @@ class OurDomainScraper(AbstractScraper):
                 )
                 # 成功通过 → 标记这个指纹"好"，下次 scrape() 会优先用它
                 _mark_fingerprint_good(impersonate)
+                last_blocked = None  # 清除之前的失败状态——成功意味着不需要浏览器兜底
                 break
             except BlockedError as e:
                 last_blocked = e
@@ -193,19 +280,39 @@ class OurDomainScraper(AbstractScraper):
                         display, idx + 1, len(attempts), impersonate, attempts[idx],
                     )
                     continue
-                raise BlockedError(
-                    f"{e} 已尝试 TLS 指纹: {', '.join(tried)}。"
-                    "如仍被挡，可配置 HTTPS_PROXY 换出口 IP，或用 "
-                    "OURDOMAIN_IMPERSONATES 调整指纹顺序。"
-                ) from e
+                # curl_cffi 全指纹失败 → 进入浏览器兜底路径
+                logger.warning(
+                    "[%s] OurDomain curl_cffi 全指纹失败 (%s)，切换到 CloakBrowser 兜底",
+                    display, ", ".join(tried),
+                )
+                break
             except RateLimitError:
                 raise
             except Exception as e:
                 raise ScrapeNetworkError(f"[{display}] OurDomain 抓取失败: {e}") from e
         else:
-            if last_blocked is not None:
-                raise last_blocked
+            # for...else: 循环正常结束（没有 break）= attempts 为空
             all_units, complete, fp_names_by_id = {}, False, {}
+
+        # ── 阶段 2：CloakBrowser 兜底路径 ───────────────────────────
+        # curl_cffi 全指纹失败（BlockedError）时，用 CloakBrowser 执行 CF
+        # JS challenge，通过后用浏览器内 fetch() 获取 HTML。
+        if last_blocked is not None:
+            try:
+                all_units, complete, fp_names_by_id = self._scrape_via_browser(
+                    display=display,
+                    base=base,
+                    floorplans_url=floorplans_url,
+                    property_id=property_id,
+                    move_in_date=move_in_date,
+                )
+            except BlockedError:
+                # 浏览器兜底也失败了 → 上抛最终错误
+                raise BlockedError(
+                    f"[{display}] OurDomain curl_cffi + CloakBrowser 均被 403。"
+                    f"curl_cffi 已试指纹: {', '.join(tried)}。"
+                    "可能需要更换出口 IP 或等待 Cloudflare 冷却。"
+                ) from last_blocked
 
         listings = [
             _to_listing(
@@ -221,16 +328,73 @@ class OurDomainScraper(AbstractScraper):
             for unit in all_units.values()
         ]
         logger.info(
-            "[%s] %s 抓取完成: fingerprint=%s, attempts=%d/%d, units=%d, complete=%s",
+            "[%s] %s 抓取完成: method=%s, units=%d, complete=%s",
             display,
             "OurCampus" if task.source == "ourcampus" else "OurDomain",
-            impersonate,
-            len(tried),
-            len(attempts),
+            "browser" if last_blocked is not None else f"curl_cffi/{impersonate}" if tried else "none",
             len(listings),
             complete,
         )
         return ScrapeResult(task=task, listings=listings, complete=complete)
+
+    def _scrape_via_browser(
+        self,
+        *,
+        display: str,
+        base: str,
+        floorplans_url: str,
+        property_id: str,
+        move_in_date: str,
+    ) -> tuple[dict[str, dict], bool, dict[str, str]]:
+        """
+        CloakBrowser 兜底抓取：浏览器执行 CF challenge 后 fetch HTML。
+
+        与 ``_scrape_once`` 逻辑相同，但 HTTP 请求走浏览器内 fetch()
+        而非 curl_cffi session。
+        """
+        fetcher = self._ensure_browser(floorplans_url)
+
+        all_units: dict[str, dict] = {}
+        complete = True
+
+        # Phase 1: floorplans.aspx
+        fp_html = fetcher.fetch_html(floorplans_url)
+        fp_ids = _extract_floorplan_ids(fp_html)
+        if not fp_ids:
+            logger.warning("[%s] OurDomain (browser) 未发现 floorplan id", display)
+            return {}, False, {}
+
+        fp_names_by_id = _extract_floorplan_names(fp_html)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[%s] OurDomain (browser) FP names: %d / %d",
+                display, len(fp_names_by_id), len(fp_ids),
+            )
+
+        # Phase 2: rcLoadContent.ashx per floorplan
+        for fp_id in fp_ids:
+            url = (
+                f"{base}/rcLoadContent.ashx"
+                f"?contentclass=availableunits"
+                f"&floorPlans={fp_id}"
+                f"&MoveInDate={move_in_date}"
+                f"&myolePropertyID={property_id}"
+            )
+            try:
+                unit_html = fetcher.fetch_html(url, referer=floorplans_url, ajax=True)
+            except (RateLimitError, BlockedError):
+                raise
+            except Exception as e:
+                complete = False
+                logger.error(
+                    "[%s] OurDomain (browser) availableunits 失败 fp_id=%s: %s",
+                    display, fp_id, e,
+                    exc_info=True,
+                )
+                continue
+            for unit in _extract_units(unit_html):
+                _merge_unit(all_units, unit, fp_id)
+        return all_units, complete, fp_names_by_id
 
     def _scrape_once(
         self,

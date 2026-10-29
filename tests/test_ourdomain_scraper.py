@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import patch, MagicMock
 
 from scrapers.base import BlockedError, ScrapeTask
 from scrapers.ourdomain import (
@@ -254,15 +255,23 @@ def test_scrape_builds_unit_level_listings(monkeypatch):
 
 
 def test_scrape_raises_blocked_error(monkeypatch):
+    """curl_cffi 全指纹失败 + 浏览器兜底也失败 → 抛 BlockedError。"""
     monkeypatch.setattr("scrapers.ourdomain.req.Session", BlockedSession)
     monkeypatch.setattr("scrapers.ourdomain.get_impersonate", lambda: "chrome131")
     monkeypatch.setattr("scrapers.ourdomain.get_proxy_url", lambda: "")
     monkeypatch.setenv("OURDOMAIN_WAF_RETRIES", "2")
     monkeypatch.setenv("OURDOMAIN_IMPERSONATES", "chrome131,safari17_0")
 
+    scraper = OurDomainScraper()
+    # Mock browser fallback to also raise BlockedError
+    monkeypatch.setattr(
+        scraper, "_scrape_via_browser",
+        MagicMock(side_effect=BlockedError("browser also blocked")),
+    )
+
     task = ScrapeTask(source="ourdomain", city_key="diemen", city_display="Amsterdam Diemen")
     with pytest.raises(BlockedError) as exc:
-        OurDomainScraper().scrape(task)
+        scraper.scrape(task)
     assert "chrome131, safari17_0" in str(exc.value)
 
 
@@ -274,19 +283,100 @@ def test_scrape_retries_cloudflare_with_next_tls_fingerprint(monkeypatch):
     monkeypatch.setenv("OURDOMAIN_WAF_RETRIES", "2")
     monkeypatch.setenv("OURDOMAIN_IMPERSONATES", "chrome131,safari17_0")
 
+    scraper = OurDomainScraper()
+    # Prevent real CloakBrowser launch if curl_cffi happens to fail both attempts
+    monkeypatch.setattr(
+        scraper, "_scrape_via_browser",
+        MagicMock(side_effect=BlockedError("should not reach browser")),
+    )
+
     task = ScrapeTask(
         source="ourdomain",
         city_key="diemen",
         city_display="Amsterdam Diemen",
         extra={"move_in_date": "2026-06-01"},
     )
-    result = OurDomainScraper().scrape(task)
+    result = scraper.scrape(task)
 
     assert len(result.listings) == 2
     assert [s.impersonate for s in FirstBlockedThenOkSession.instances] == [
         "chrome131",
         "safari17_0",
     ]
+    # Browser fallback should NOT have been called (curl_cffi succeeded on 2nd)
+    scraper._scrape_via_browser.assert_not_called()
+
+
+def test_scrape_falls_back_to_browser_when_curl_cffi_blocked(monkeypatch):
+    """curl_cffi 全指纹 403 → 浏览器兜底成功 → 返回正常结果。"""
+    monkeypatch.setattr("scrapers.ourdomain.req.Session", BlockedSession)
+    monkeypatch.setattr("scrapers.ourdomain.get_impersonate", lambda: "chrome131")
+    monkeypatch.setattr("scrapers.ourdomain.get_proxy_url", lambda: "")
+    monkeypatch.setenv("OURDOMAIN_WAF_RETRIES", "2")
+    monkeypatch.setenv("OURDOMAIN_IMPERSONATES", "chrome131,safari17_0")
+
+    scraper = OurDomainScraper()
+
+    # Mock browser fallback to return real parsed data
+    fake_units = {
+        "307195": {
+            "unit_id": "307195",
+            "apt": "#6045",
+            "sqft": "22",
+            "rent": "€ 1.587",
+            "deposit": "€ 2.622",
+            "detail": "Ground Floor",
+            "floor": 0,
+            "status": "Available to book",
+            "avail_date": "2026-06-06",
+            "fp_ids": ["1107060"],
+        },
+    }
+    fake_fp_names = {"1107060": "Superior Studio 1-person max."}
+    monkeypatch.setattr(
+        scraper, "_scrape_via_browser",
+        MagicMock(return_value=(fake_units, True, fake_fp_names)),
+    )
+
+    task = ScrapeTask(
+        source="ourdomain",
+        city_key="diemen",
+        city_display="Amsterdam Diemen",
+        extra={"move_in_date": "2026-06-01"},
+    )
+    result = scraper.scrape(task)
+
+    assert result.complete is True
+    assert len(result.listings) == 1
+    assert result.listings[0].id == "od_307195"
+    assert result.listings[0].source == "ourdomain"
+    # Verify browser fallback was actually called
+    scraper._scrape_via_browser.assert_called_once()
+
+
+def test_scrape_curl_cffi_success_does_not_invoke_browser(monkeypatch):
+    """curl_cffi 成功时不应启动浏览器。"""
+    monkeypatch.setattr("scrapers.ourdomain.req.Session", FakeSession)
+    monkeypatch.setattr("scrapers.ourdomain.get_impersonate", lambda: "chrome131")
+    monkeypatch.setattr("scrapers.ourdomain.get_proxy_url", lambda: "")
+
+    scraper = OurDomainScraper()
+    # Spy on _scrape_via_browser to ensure it's NOT called
+    monkeypatch.setattr(
+        scraper, "_scrape_via_browser",
+        MagicMock(side_effect=AssertionError("browser should not be called")),
+    )
+
+    task = ScrapeTask(
+        source="ourdomain",
+        city_key="diemen",
+        city_display="Amsterdam Diemen",
+        extra={"move_in_date": "2026-06-01"},
+    )
+    result = scraper.scrape(task)
+
+    assert len(result.listings) == 2
+    scraper._scrape_via_browser.assert_not_called()
 
 
 # ─── data-label fallback（应对 South-East 等替代主题）────────────────
