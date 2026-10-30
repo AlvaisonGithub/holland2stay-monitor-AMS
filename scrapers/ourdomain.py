@@ -518,6 +518,8 @@ class OurDomainScraper(AbstractScraper):
                 has_subpointer = "subPointerId" in fp_html
                 has_myfloorplan = "myFloorPlanId" in fp_html
                 has_fp_detail = "FP_Detail_" in fp_html
+                has_data_fp_id = "data-fp-id" in fp_html
+                has_zenrows_extract = "zenrows-fp-extract" in fp_html
                 has_floorplan_selector = "floor-plan-selector" in fp_html
                 has_ffloorplan = "FFloorPlan" in fp_html
                 has_data_selenium = "data-selenium-id" in fp_html
@@ -526,12 +528,13 @@ class OurDomainScraper(AbstractScraper):
                 logger.warning(
                     "[%s] 未发现 floorplan id (html=%d chars). "
                     "Patterns found: subPointerId=%s, myFloorPlanId=%s, "
-                    "FP_Detail=%s, floor-plan-selector=%s, FFloorPlan=%s, "
+                    "FP_Detail=%s, data-fp-id=%s, zenrows-extract=%s, "
+                    "floor-plan-selector=%s, FFloorPlan=%s, "
                     "data-selenium-id=%s, floorPlan JS=%s. "
                     "HTML first 1000 chars: %s",
                     display, len(fp_html),
                     has_subpointer, has_myfloorplan,
-                    has_fp_detail,
+                    has_fp_detail, has_data_fp_id, has_zenrows_extract,
                     has_floorplan_selector, has_ffloorplan,
                     has_data_selenium, has_fp_js,
                     fp_html[:1000],
@@ -818,25 +821,32 @@ def _headers_for(url: str, *, referer: str = "", ajax: bool = False) -> dict[str
 def _extract_floorplan_ids(html: str) -> list[str]:
     # RENTCafe floorplan IDs can appear in several patterns depending on
     # whether the HTML is server-side rendered (curl_cffi) or JS-rendered
-    # (BrightData with render=true, CloakBrowser):
+    # (ZenRows mode=auto, BrightData with render=true, CloakBrowser):
     #
-    #   subPointerId=NNNN          — photo gallery onclick (Diemen)
+    #   subPointerId=NNNN          — photo gallery onclick (Diemen, server-side)
     #   myFloorPlanId=NNNN         — Get Notified / Contact Us links (South-East)
     #   FP_Detail_NNNN             — anchor href in floor-plan list (South-East v2)
     #   data-floorplanid="NNNN"    — JS-hydrated floor-plan-selector elements
+    #   data-fp-id="NNNN"          — injected by ZenRows js_instructions evaluate
     #   floorplanid=NNNN           — query-string in JS variable assignments
     #   "floorPlanId":NNNN         — JSON in script tags (JS-rendered pages)
     #   fpId\s*=\s*['"]?NNNN       — JS variable assignment
-    #   olePropertyID=NNNN         — property ID (not floorplan, excluded)
     #
-    # Also try a broader search for 7-digit IDs near floorplan-related keywords
-    # as a last resort (JS-rendered pages may embed IDs in unexpected places).
+    # The data-fp-id pattern is special: it's injected by ZenRowsFetcher's
+    # js_instructions evaluate script, which runs in the browser context
+    # after JS rendering. It extracts IDs from onclick handlers, href attrs,
+    # data attributes, and script tags — then injects them as
+    # <span data-fp-id="NNNN"> inside <div id="zenrows-fp-extract">.
+    # This ensures IDs are available even when JS hydration strips onclick.
     ids = re.findall(r"subPointerId=(\d+)", html)
     if not ids:
         ids = re.findall(r"myFloorPlanId=(\d+)", html)
     if not ids:
         # South-East v2 theme: floor-plan list anchors use #FP_Detail_NNNN
         ids = re.findall(r"FP_Detail_(\d+)", html)
+    if not ids:
+        # ZenRows js_instructions injected data (JS-rendered pages)
+        ids = re.findall(r'data-fp-id=["\'](\d+)', html, re.I)
     if not ids:
         # JS-rendered HTML may use data attributes
         ids = re.findall(r'data-floorplanid["\s]*=["\s]*(\d+)', html, re.I)
@@ -855,7 +865,7 @@ def _extract_floorplan_ids(html: str) -> list[str]:
         # This catches cases where JS rendering changed the attribute name
         # but the ID is still near floorplan-related keywords.
         # Pattern: any 6-8 digit number near "floorPlan" or "availableunits"
-        # or "Get Notified" in a 200-char window.
+        # or "Get Notified" in a 300-char window.
         for m in re.finditer(
             r'(?:floorPlan|availableunits|Get\s+Notified|showDialog)',
             html, re.I,
@@ -863,8 +873,6 @@ def _extract_floorplan_ids(html: str) -> list[str]:
             window = html[m.start():m.start() + 300]
             fp_match = re.findall(r'\b(\d{6,8})\b', window)
             if fp_match:
-                # Filter out property IDs (typically 6 digits, but floorplan
-                # IDs are 7 digits for OurDomain). Keep all and dedupe later.
                 ids.extend(fp_match)
     return list(dict.fromkeys(ids))
 

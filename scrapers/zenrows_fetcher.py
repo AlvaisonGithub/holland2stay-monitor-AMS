@@ -24,13 +24,13 @@ Key advantages over BrightData for this use case:
 - Bypasses Cloudflare WAF, JS challenges, CAPTCHAs
 
 Credit costs (per request):
-    Raw HTML + premium proxy:   10 credits  (normal — CF WAF bypass)
-    JS render + premium proxy:  25 credits  (fallback — CF JS challenge)
+    Standard request:            1 credit
+    JS rendering:                5 credits
+    Premium proxies:            10 credits
+    JS + premium proxies:       25 credits (typical for CF WAF sites)
 
-With explicit ``premium_proxy=true`` (no ``js_render``), we get raw server
-HTML preserving ``onclick`` attributes that contain floorplan IDs.
-If CF challenge detected, retry with ``js_render=true`` (25 credits).
-
+With ``mode=auto``, ZenRows bills only for the configuration that succeeds.
+For RENTCafe CF WAF sites, this is typically JS + premium proxies (25 credits).
 With floorplan ID caching (12h TTL), budget is manageable within
 5,000 credits/month.
 
@@ -158,17 +158,20 @@ class ZenRowsFetcher:
     - ``fetch_html(url, referer, ajax)`` — GET HTML via ZenRows API
     - ``close()`` — no-op (no browser to close)
 
-    Strategy: explicit ``premium_proxy=true`` without ``js_render`` to get
-    raw server-side HTML. This is critical for RENTCafe because floorplan IDs
-    (``subPointerId=NNN``) live in server-rendered ``onclick`` attributes
-    that get stripped during JS hydration.
+    Strategy: ``mode=auto`` (Adaptive Stealth Mode) for reliable CF WAF
+    bypass. ZenRows auto-selects js_render + premium_proxy when needed.
 
-    If raw HTML returns CF challenge, retries with ``js_render=true``
-    (25 credits fallback).
+    For non-AJAX page fetches (floorplans.aspx), uses ``js_instructions``
+    with ``evaluate`` to extract floorplan IDs from the JS-rendered DOM
+    and inject them as ``<span data-fp-id="NNNN">`` elements. This
+    compensates for ``onclick`` attributes being stripped during JS
+    hydration — the caller's regex finds ``data-fp-id`` patterns instead.
 
-    Credit costs:
-    - Raw HTML + premium proxy:  10 credits (normal)
-    - JS render + premium proxy: 25 credits (fallback only)
+    Credit costs (mode=auto bills only for successful configuration):
+    - Standard request:           1 credit
+    - JS rendering:                5 credits
+    - Premium proxies:            10 credits
+    - JS + premium proxies:       25 credits (typical for CF WAF sites)
     """
 
     API_URL = "https://api.zenrows.com/v1/"
@@ -260,17 +263,14 @@ class ZenRowsFetcher:
         """
         GET HTML from a URL via ZenRows Fetch API.
 
-        Strategy: use explicit ``premium_proxy=true`` without ``js_render``
-        to get raw server-side HTML. This is critical for RENTCafe floorplans
-        because floorplan IDs (``subPointerId=NNN``) live in server-rendered
-        ``onclick`` attributes that get stripped during JS hydration.
+        Uses ``mode=auto`` (Adaptive Stealth Mode) which automatically
+        handles CF WAF bypass, JS challenges, and CAPTCHA solving.
+        ZenRows bills only for the configuration that succeeds.
 
-        If the raw-HTML attempt returns a CF challenge page, retry with
-        ``js_render=true`` + ``premium_proxy=true`` (25 credits) as fallback.
-
-        Credit costs:
-        - Raw HTML + premium proxy:  10 credits (normal)
-        - JS render + premium proxy: 25 credits (fallback only)
+        For non-AJAX page fetches, uses ``js_instructions`` with ``evaluate``
+        to extract floorplan IDs from the JS-rendered DOM and inject them
+        as ``<span data-fp-id="NNNN">`` elements. This ensures floorplan IDs
+        are available even when JS hydration strips ``onclick`` attributes.
 
         Parameters
         ----------
@@ -310,30 +310,28 @@ class ZenRowsFetcher:
 
         # Build API request parameters.
         #
-        # Strategy: explicit params instead of mode=auto for deterministic
-        # raw server-side HTML. This is critical because:
+        # Strategy: mode=auto for reliable CF WAF bypass (ZenRows auto-selects
+        # js_render + premium_proxy when needed). This is the only configuration
+        # that consistently works — premium_proxy alone (no js_render) fails
+        # with RESP001 because CF requires JS challenge solving.
         #
-        # - RENTCafe floorplan IDs (subPointerId=NNN) live in server-rendered
-        #   onclick attributes — JS hydration strips them.
-        # - mode=auto sometimes uses js_render (returns JS-hydrated DOM),
-        #   sometimes doesn't (returns raw HTML) — non-deterministic.
-        # - We need raw HTML consistently for regex extraction to work.
+        # Trade-off: mode=auto may return JS-rendered DOM where server-side
+        # onclick attributes (containing subPointerId=NNN) are stripped during
+        # hydration. To compensate, we use js_instructions with evaluate to
+        # extract floorplan-related data from the JS context and inject it
+        # as a visible DOM element before the final HTML is captured.
         #
-        # Configuration: premium_proxy=true, js_render NOT set (defaults false)
-        # - Bypasses CF WAF (needs residential proxy)
-        # - Returns raw server HTML (preserves onclick attributes)
-        # - Cost: 10 credits per request
+        # For AJAX calls: no js_instructions needed (AJAX returns server-
+        # generated HTML fragments, not JS-rendered pages).
         #
-        # Fallback: if CF challenge detected, retry with js_render=true +
-        # premium_proxy=true (25 credits). JS render may solve CF JS challenge
-        # but will lose onclick patterns — caller needs JS-rendered fallback
-        # patterns for floorplan ID extraction.
+        # Credit cost: 25 credits (js_render + premium_proxy) when mode=auto
+        # escalates to both. This is the only working configuration for CF
+        # WAF protected RENTCafe sites.
 
         params: dict[str, str] = {
             "apikey": self._api_key,
             "url": url,
-            "premium_proxy": "true",  # Bypass CF WAF (residential proxy)
-            # js_render NOT set — defaults to false (raw server HTML)
+            "mode": "auto",  # Adaptive Stealth Mode — auto-selects best bypass
         }
 
         # Add proxy_country for Netherlands (better geo-matching)
@@ -343,6 +341,76 @@ class ZenRowsFetcher:
 
         # Return original status code for debugging
         params["original_status"] = "true"
+
+        # For non-AJAX page fetches (floorplans.aspx), use js_instructions
+        # to extract floorplan IDs from the JS-rendered DOM and inject them
+        # as visible elements. This compensates for onclick attributes being
+        # stripped during JS hydration.
+        #
+        # The evaluate script:
+        # 1. Searches the DOM for elements with data attributes containing
+        #    floorplan IDs (data-selenium-id, data-floorplanid, etc.)
+        # 2. Searches onclick handlers still attached via JS event listeners
+        # 3. Searches window/global JS variables for floorplan arrays
+        # 4. Injects findings as a hidden <div id="zenrows-fp-extract">
+        #    containing data-fp-id attributes for each found ID
+        if not ajax:
+            # JSON array of JS instruction objects.
+            # The evaluate script runs in the page's JS context after
+            # rendering, before ZenRows captures the final HTML.
+            extract_script = (
+                "(function(){"
+                # Collect all 6-8 digit numbers from elements that have
+                # floorplan-related attributes or are inside floorplan
+                # containers.
+                "var ids=[];"
+                # 1. onclick attributes (may survive in some themes)
+                "document.querySelectorAll('[onclick]').forEach(function(el){"
+                "var m=(el.getAttribute('onclick')||'').match(/subPointerId=(\\d+)/);"
+                "if(m)ids.push(m[1]);"
+                "m=(el.getAttribute('onclick')||'').match(/myFloorPlanId=(\\d+)/);"
+                "if(m)ids.push(m[1]);"
+                "});"
+                # 2. href attributes with #FP_Detail_NNNN
+                "document.querySelectorAll('a[href*=\"FP_Detail_\"]').forEach(function(el){"
+                "var m=el.getAttribute('href').match(/FP_Detail_(\\d+)/);"
+                "if(m)ids.push(m[1]);"
+                "});"
+                # 3. data attributes
+                "document.querySelectorAll('[data-floorplanid],[data-selenium-id^=\"urow\"]').forEach(function(el){"
+                "var v=el.getAttribute('data-floorplanid');"
+                "if(v)ids.push(v);"
+                "});"
+                # 4. Search script tags for JSON floorPlanId
+                "document.querySelectorAll('script').forEach(function(s){"
+                "var t=s.textContent||'';"
+                "var ms=t.matchAll(/subPointerId=(\\d{6,8})/g);"
+                "for(var m of ms)ids.push(m[1]);"
+                "ms=t.matchAll(/myFloorPlanId=(\\d{6,8})/g);"
+                "for(var m of ms)ids.push(m[1]);"
+                "ms=t.matchAll(/\"floorPlanId\"\\s*:\\s*(\\d+)/g);"
+                "for(var m of ms)ids.push(m[1]);"
+                "});"
+                # Dedupe and inject as visible DOM element
+                "ids=[...new Set(ids)];"
+                "if(ids.length>0){"
+                "var d=document.createElement('div');"
+                "d.id='zenrows-fp-extract';"
+                "d.setAttribute('style','display:none');"
+                "ids.forEach(function(id){"
+                "var s=document.createElement('span');"
+                "s.setAttribute('data-fp-id',id);"
+                "d.appendChild(s);"
+                "});"
+                "document.body.appendChild(d);"
+                "}"
+                "})()"
+            )
+            import json as _json
+            params["js_instructions"] = _json.dumps([
+                {"wait_for": "body"},
+                {"evaluate": extract_script},
+            ])
 
         # For AJAX calls, pass custom headers.
         # ZenRows API: set custom_headers=true in query params (boolean toggle),
@@ -426,8 +494,10 @@ class ZenRowsFetcher:
 
         html = resp.text
 
-        # Estimate credit cost: premium_proxy=true = 10 credits per request.
-        estimated_cost = 10
+        # Estimate credit cost: mode=auto for CF WAF sites typically uses
+        # js_render + premium_proxy = 25 credits. For AJAX calls (server-
+        # generated fragments), may use premium_proxy only = 10 credits.
+        estimated_cost = 25 if not ajax else 10
         _consume_credit(estimated_cost)
 
         # Log response details for debugging
@@ -439,71 +509,19 @@ class ZenRowsFetcher:
         )
 
         # Check if returned HTML is a CF challenge page.
-        # If so, retry with js_render=true + premium_proxy=true (25 credits).
-        # JS rendering may solve CF JS challenges that raw HTML can't bypass.
+        # mode=auto should handle CF challenges, but if it still returns one,
+        # there's nothing more we can do.
         if self._is_cf_challenge(html):
             logger.warning(
-                "ZenRows raw HTML was CF challenge for %s. "
-                "Retrying with js_render=true (25 credits). "
+                "ZenRows returned CF challenge page for %s (mode=auto). "
                 "HTML first 500 chars: %s",
                 url, html[:500],
             )
-            # Retry with JS rendering
-            retry_params = dict(params)
-            retry_params["js_render"] = "true"
-            # Wait for page to load after JS execution
-            retry_params["wait_for"] = "body"
-
-            retry_start = time.monotonic()
-            try:
-                retry_resp = _requests.get(
-                    self.API_URL,
-                    params=retry_params,
-                    headers=req_headers,
-                    timeout=api_timeout,
-                )
-            except _requests.exceptions.Timeout:
-                raise _exc("ScrapeNetworkError")(
-                    f"ZenRows API timeout after {api_timeout}s (js_render retry) for url={url}"
-                )
-            except _requests.exceptions.ConnectionError as e:
-                raise _exc("ScrapeNetworkError")(
-                    f"ZenRows API connection error (js_render retry): {e}"
-                )
-
-            retry_elapsed = time.monotonic() - retry_start
-
-            if retry_resp.status_code >= 400:
-                try:
-                    err = retry_resp.json()
-                    msg = err.get("detail", err.get("message", retry_resp.text[:300]))
-                except Exception:
-                    msg = retry_resp.text[:300]
-                raise _exc("ScrapeNetworkError")(
-                    f"ZenRows js_render retry error HTTP {retry_resp.status_code}: {msg}"
-                )
-
-            html = retry_resp.text
-            _consume_credit(15)  # js_render + premium_proxy = 25 total (10 already counted)
-
-            logger.info(
-                "ZenRows js_render retry: url=%s, api_status=%d, %.1fs, %d chars, "
-                "credits=~%d/%d (est)",
-                url, retry_resp.status_code, retry_elapsed, len(html),
-                get_credit_usage(), get_credit_limit(),
+            raise _exc("BlockedError")(
+                f"ZenRows returned CF challenge page for {url} "
+                "even with mode=auto. The site may have protection "
+                "that ZenRows cannot bypass."
             )
-
-            # Check again for CF challenge
-            if self._is_cf_challenge(html):
-                logger.warning(
-                    "ZenRows js_render retry also returned CF challenge for %s. "
-                    "HTML first 500 chars: %s",
-                    url, html[:500],
-                )
-                raise _exc("BlockedError")(
-                    f"ZenRows returned CF challenge page for {url} even with js_render. "
-                    "The site may have protection that ZenRows cannot bypass."
-                )
 
         # Check for empty or suspiciously short responses
         if len(html) < 200:
