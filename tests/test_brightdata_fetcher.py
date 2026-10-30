@@ -174,10 +174,12 @@ class TestBrightDataFetcher:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         # format=json returns {status_code, headers, body}
+        # Body must be >200 chars to avoid triggering retry logic
+        body = "<html><body>" + "Floor plans here. " * 20 + "</body></html>"
         mock_resp.json.return_value = {
             "status_code": 200,
             "headers": {"content-type": "text/html"},
-            "body": "<html><body>Floor plans here</body></html>",
+            "body": body,
         }
         mock_resp.headers = {}
         mock_post.return_value = mock_resp
@@ -195,14 +197,19 @@ class TestBrightDataFetcher:
         assert payload["url"] == "https://example.com/floorplans.aspx"
         assert payload["format"] == "json"
         assert payload["method"] == "GET"
-        assert payload["render"] == "true"
+        # render should NOT be in the default payload — it's added only
+        # on retry if the first attempt returns a CF challenge or 5xx.
+        # The floorplan IDs are in server-side rendered HTML, so we don't
+        # need JS rendering by default.
+        assert "render" not in payload
 
         # Verify auth header
         headers = call_args[1]["headers"]
         assert headers["Authorization"] == "Bearer test_key_123"
 
-        # Verify x-unblock-expect is sent as HTTP header (not in payload body)
-        assert "x-unblock-expect" in headers
+        # Without render=true, we don't send x-unblock-expect
+        # (the floorplan IDs are in server-side HTML, no need to wait for JS)
+        assert "x-unblock-expect" not in headers
         assert "headers" not in payload  # "headers" is NOT a valid body field
 
     @patch("requests.post")
@@ -228,22 +235,27 @@ class TestBrightDataFetcher:
 
     @patch("requests.post")
     def test_cf_challenge_in_response_raises_blocked(self, mock_post, monkeypatch):
-        """If API returns a CF challenge page, raise BlockedError."""
+        """If API returns a CF challenge page on both initial and render retry,
+        raise BlockedError."""
         monkeypatch.setenv("BRIGHTDATA_API_KEY", "test_key")
         monkeypatch.setenv("BRIGHTDATA_MONTHLY_CREDIT_LIMIT", "5000")
         mod = _import_fetcher()
         mod._credit_used = 0
         mod._credit_month = mod._current_month()
 
+        cf_body = (
+            "<html><head><title>Just a moment...</title></head>"
+            "<body><!-- challenge-platform --></body></html>"
+        )
+
+        # First call (no render): returns CF challenge
+        # Subsequent calls (with render): also return CF challenge
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        # format=json returns {status_code, headers, body}
-        # Use a real CF challenge page with <title>Just a moment...</title>
         mock_resp.json.return_value = {
             "status_code": 403,
             "headers": {},
-            "body": "<html><head><title>Just a moment...</title></head>"
-                    "<body><!-- challenge-platform --></body></html>",
+            "body": cf_body,
         }
         mock_resp.headers = {}
         mock_post.return_value = mock_resp

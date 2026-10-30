@@ -325,23 +325,30 @@ class BrightDataFetcher:
         # are ignored by default unless "Custom Headers & Cookies" is enabled
         # in the zone config. The API auto-generates optimal headers.
         #
-        # render=true: Force JS rendering via browser. RENTCafe floorplans.aspx
-        # requires JS to fully render floorplan selectors. Without render=true,
-        # the API may return a CF challenge page or an incomplete HTML.
+        # Strategy for render:
+        # - For floorplans.aspx (non-AJAX page): try WITHOUT render first.
+        #   The floorplan IDs (subPointerId=, myFloorPlanId=) are in the
+        #   server-side rendered HTML — they don't need JS. Without render,
+        #   BrightData returns the raw server HTML (faster, cheaper, and
+        #   preserves the onclick attributes that contain the IDs).
+        #   If that returns a CF challenge, we retry with render=true.
+        # - For AJAX calls: never use render (server-generated HTML fragment).
         #
         # format=json: Returns {status_code, headers, body} instead of raw HTML.
         # This lets us inspect the target's actual HTTP status code.
-        #
-        # x-unblock-expect: Sent as an HTTP header on the API request (NOT in
-        # the payload body). Tells the API to wait for specific CSS selectors
-        # before returning — ensures the page is fully loaded.
+        use_render = False if not ajax else False  # Default: no render
+
         payload: dict = {
             "zone": self._zone,
             "url": url,
             "format": "json",  # Structured response with status_code + body
             "method": "GET",
-            "render": "true",  # Force JS rendering — essential for CF challenge + RENTCafe JS
         }
+
+        # Add render only if needed (will be added in retry logic if first
+        # attempt returns a CF challenge)
+        if use_render:
+            payload["render"] = "true"
 
         # Add country code for Netherlands (better geo-matching)
         country = os.environ.get("BRIGHTDATA_COUNTRY", "").strip()
@@ -349,19 +356,20 @@ class BrightDataFetcher:
             payload["country"] = country
 
         # Build HTTP headers for the API request itself.
-        # x-unblock-expect goes here (as an HTTP header), NOT in the payload body.
         api_headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._api_key}",
         }
 
-        if not ajax:
-            # For page requests: wait for RENTCafe elements before returning.
-            # This ensures JS has rendered the floorplan selectors.
+        if not ajax and use_render:
+            # Only use x-unblock-expect when render=true (JS rendering).
+            # Without render, the content is server-side HTML — no need to
+            # wait for elements. The "body" selector in the expect header
+            # was matching too early and returning before JS loaded content.
             api_headers["x-unblock-expect"] = json.dumps({
-                "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan, body",
+                "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan",
             })
-        else:
+        elif ajax:
             # For AJAX calls: tell the API to add X-Requested-With header
             # to the outbound request to the target site.
             # NOTE: This requires "Custom Headers & Cookies" enabled in the
@@ -465,36 +473,54 @@ class BrightDataFetcher:
             get_credit_usage(), get_credit_limit(),
         )
 
-        # Check if returned HTML is still a CF challenge (shouldn't happen
-        # with Web Unlocker + render=true, but guard against it)
-        if self._is_cf_challenge(html):
-            logger.warning(
-                "BrightData returned CF challenge page for %s (unexpected with render=true). "
-                "HTML first 500 chars: %s",
-                url, html[:500],
+        # Check if returned HTML is a CF challenge page.
+        # If so (and we didn't use render), retry with render=true below.
+        # The final CF-challenge raise is AFTER the retry loop.
+        needs_render_retry = (
+            not ajax
+            and not use_render
+            and (
+                self._is_cf_challenge(html)
+                or (isinstance(target_status, int) and target_status >= 500)
+                or len(html) < 200
             )
-            raise _exc("BlockedError")(
-                f"BrightData returned CF challenge page for {url}. "
-                "Web Unlocker may not be able to bypass this CF level."
-            )
+        )
 
-        # If target returned a server error (5xx), try alternative strategies.
-        # The 502 might be from:
-        # 1. The x-unblock-expect header triggering server-side errors
-        # 2. The render=true causing a timeout on the target's backend
-        # 3. The NL country code causing geo-blocking on the target
-        # Try: no-expect → no-render → different-country
-        if isinstance(target_status, int) and target_status >= 500 and not ajax:
-            retry_strategies = [
-                # Strategy 1: Remove x-unblock-expect (let BrightData auto-handle)
-                ("no-expect", {**payload}, {k: v for k, v in api_headers.items() if k != "x-unblock-expect"}),
-                # Strategy 2: Remove render (faster, might avoid backend timeout)
-                ("no-render", {k: v for k, v in payload.items() if k != "render"},
-                 {k: v for k, v in api_headers.items() if k != "x-unblock-expect"}),
-                # Strategy 3: Try US country (different proxy pool)
-                ("us-country", {**{k: v for k, v in payload.items() if k != "render"}, "country": "us"},
-                 {k: v for k, v in api_headers.items() if k != "x-unblock-expect"}),
-            ]
+        # Retry strategies for 5xx errors, CF challenges, or empty responses.
+        # Since we started without render, the main retry is adding render=true.
+        # Also try different countries for 5xx errors.
+        if needs_render_retry or (isinstance(target_status, int) and target_status >= 500 and not ajax):
+            retry_strategies: list[tuple[str, dict, dict]] = []
+
+            if not use_render and not ajax:
+                # Strategy 1: Add render=true (JS rendering to solve CF challenge)
+                render_payload = {**payload, "render": "true"}
+                render_headers = dict(api_headers)
+                render_headers["x-unblock-expect"] = json.dumps({
+                    "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan",
+                })
+                retry_strategies.append(("render", render_payload, render_headers))
+
+            if isinstance(target_status, int) and target_status >= 500:
+                # Strategy 2: Try US country (different proxy pool, may avoid 502)
+                us_payload = {**payload}
+                if not use_render:
+                    us_payload["render"] = "true"
+                us_payload["country"] = "us"
+                us_headers = dict(api_headers)
+                if "x-unblock-expect" not in us_headers:
+                    us_headers["x-unblock-expect"] = json.dumps({
+                        "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan",
+                    })
+                retry_strategies.append(("us-render", us_payload, us_headers))
+
+                # Strategy 3: Try GB country
+                gb_payload = {**payload}
+                if not use_render:
+                    gb_payload["render"] = "true"
+                gb_payload["country"] = "gb"
+                gb_headers = dict(us_headers)
+                retry_strategies.append(("gb-render", gb_payload, gb_headers))
 
             for strategy_name, retry_payload, retry_hdrs in retry_strategies:
                 if not is_credit_available():
@@ -551,12 +577,39 @@ class BrightDataFetcher:
                         strategy_name, retry_status or "?", len(retry_html),
                     )
 
+        # After all retry strategies, if the HTML is STILL a CF challenge,
+        # we've exhausted our options — raise BlockedError.
+        # (This catches the case where both the initial no-render attempt AND
+        # all render retries returned CF challenge pages.)
+        if self._is_cf_challenge(html):
+            logger.warning(
+                "BrightData returned CF challenge page for %s after all retries. "
+                "HTML first 500 chars: %s",
+                url, html[:500],
+            )
+            raise _exc("BlockedError")(
+                f"BrightData returned CF challenge page for {url}. "
+                "Web Unlocker may not be able to bypass this CF level."
+            )
+
         # Check for empty or suspiciously short responses
         if len(html) < 200:
             logger.warning(
                 "BrightData returned very short response (%d chars) for %s. "
                 "Content: %s",
                 len(html), url, html[:200],
+            )
+
+        # Detect KYC requirement — BrightData's free tier (no KYC) blocks
+        # residential proxy access to certain domains with restrictive
+        # robots.txt. This returns a 402 status with an error message.
+        if "kyc" in html.lower() and "brightdata.com/cp/kyc" in html.lower():
+            logger.error(
+                "BrightData KYC required for %s. This domain is blocked in "
+                "immediate residential (no KYC) mode. Fill in KYC form at "
+                "https://brightdata.com/cp/kyc to enable full residential access. "
+                "Response: %s",
+                url, html[:300],
             )
 
         # If target returned a server error (5xx), log it prominently.
