@@ -236,7 +236,7 @@ class BrightDataFetcher:
         - JS challenge solving (Turnstile)
         - CAPTCHA solving
         - Residential proxy rotation
-        - JS rendering (if needed)
+        - JS rendering (enabled via render=true)
 
         Parameters
         ----------
@@ -275,45 +275,57 @@ class BrightDataFetcher:
             self.ensure_initialized(url)
 
         # Build request payload
-        headers: dict[str, str] = {
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
-            ),
-            "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-        if referer:
-            headers["Referer"] = referer
-        if ajax:
-            headers.update({
-                "Accept": "text/html, */*; q=0.01",
-                "X-Requested-With": "XMLHttpRequest",
-            })
-
-        payload = {
+        #
+        # render=true: Force JS rendering via browser. RENTCafe floorplans.aspx
+        # requires JS to fully render floorplan selectors. Without render=true,
+        # the API may return a CF challenge page or an incomplete HTML.
+        #
+        # x-unblock-expect: Wait for RENTCafe-specific elements before returning.
+        # This ensures the page is fully loaded, not just CF-cleared.
+        # For AJAX calls (rcLoadContent.ashx), we don't need to wait for elements
+        # since the response is server-generated HTML fragment.
+        payload: dict = {
             "zone": self._zone,
             "url": url,
             "format": "raw",
             "method": "GET",
+            "render": "true",  # Force JS rendering — essential for CF challenge + RENTCafe JS
         }
-
-        # Only add headers if custom headers & cookies feature is enabled
-        # in the BrightData zone. Otherwise, the API auto-generates optimal headers.
-        # We include them only for AJAX calls where X-Requested-With matters.
-        if ajax:
-            payload["headers"] = headers
 
         # Add country code for Netherlands (better geo-matching)
         country = os.environ.get("BRIGHTDATA_COUNTRY", "").strip()
         if country:
             payload["country"] = country
 
+        # For non-AJAX (page) requests, wait for RENTCafe elements to appear.
+        # This prevents getting an incomplete page back.
+        # x-unblock-expect uses CSS selectors to wait for content.
+        if not ajax:
+            # Wait for floorplan-related elements that appear after JS hydration
+            payload["headers"] = {
+                "x-unblock-expect": json.dumps({
+                    "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan, body"
+                }),
+            }
+        else:
+            # AJAX calls: pass custom headers for X-Requested-With
+            # Note: Custom headers require "Custom Headers & Cookies" enabled
+            # in the zone. If not enabled, the API auto-generates headers.
+            # We try it anyway — if it fails, the response is still usable.
+            ajax_headers: dict[str, str] = {
+                "Accept": "text/html, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if referer:
+                ajax_headers["Referer"] = referer
+            payload["headers"] = ajax_headers
+
         # Make API request
         import requests as _requests
 
-        api_timeout = max(timeout_ms / 1000, 30)  # at least 30s for CF solving
+        # With render=true, CF challenge solving + JS rendering can take 30-60s.
+        # Increase timeout for page requests (non-AJAX).
+        api_timeout = max(timeout_ms / 1000, 60) if not ajax else max(timeout_ms / 1000, 45)
         start = time.monotonic()
 
         try:
@@ -376,17 +388,31 @@ class BrightDataFetcher:
         # format=raw returns the page content directly
         html = resp.text
 
+        # Log response details for debugging
+        logger.info(
+            "BrightData fetch: url=%s, status=%d, %.1fs, %d chars, credits=%d/%d",
+            url, resp.status_code, elapsed, len(html), get_credit_usage(), get_credit_limit(),
+        )
+
         # Check if returned HTML is still a CF challenge (shouldn't happen
-        # with Web Unlocker, but guard against it)
+        # with Web Unlocker + render=true, but guard against it)
         if self._is_cf_challenge(html):
             logger.warning(
-                "BrightData returned CF challenge page for %s (unexpected). "
-                "The target may have upgraded its CF protection level.",
-                url,
+                "BrightData returned CF challenge page for %s (unexpected with render=true). "
+                "HTML first 500 chars: %s",
+                url, html[:500],
             )
             raise _exc("BlockedError")(
                 f"BrightData returned CF challenge page for {url}. "
                 "Web Unlocker may not be able to bypass this CF level."
+            )
+
+        # Check for empty or suspiciously short responses
+        if len(html) < 200:
+            logger.warning(
+                "BrightData returned very short response (%d chars) for %s. "
+                "Content: %s",
+                len(html), url, html[:200],
             )
 
         logger.debug(

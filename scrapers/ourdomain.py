@@ -356,9 +356,9 @@ class OurDomainScraper(AbstractScraper):
                         display, idx + 1, len(attempts), impersonate, attempts[idx],
                     )
                     continue
-                # curl_cffi 全指纹失败 → 进入浏览器兜底路径
+                # curl_cffi 全指纹失败 → 进入 CF bypass 路径
                 logger.warning(
-                    "[%s] OurDomain curl_cffi 全指纹失败 (%s)，切换到 CloakBrowser 兜底",
+                    "[%s] OurDomain curl_cffi 全指纹失败 (%s)，切换到 CF bypass 路径 (BrightData → CloakBrowser)",
                     display, ", ".join(tried),
                 )
                 break
@@ -370,9 +370,10 @@ class OurDomainScraper(AbstractScraper):
             # for...else: 循环正常结束（没有 break）= attempts 为空
             all_units, complete, fp_names_by_id = {}, False, {}
 
-        # ── 阶段 2：CloakBrowser 兜底路径 ───────────────────────────
-        # curl_cffi 全指纹失败（BlockedError）时，用 CloakBrowser 执行 CF
-        # JS challenge，通过后用浏览器内 fetch() 获取 HTML。
+        # ── 阶段 2：CF bypass 路径（BrightData API → CloakBrowser 兜底）──
+        # curl_cffi 全指纹失败（BlockedError）时，通过 BrightData Web Unlocker
+        # API 或 CloakBrowser 获取 HTML。BrightData 优先（能处理 WAF firewall
+        # 级封锁），未配置时回退到 CloakBrowser（仅 JS challenge）。
         if last_blocked is not None:
             try:
                 all_units, complete, fp_names_by_id = self._scrape_via_browser(
