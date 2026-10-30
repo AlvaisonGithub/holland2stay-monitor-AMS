@@ -264,7 +264,7 @@ class ZenRowsFetcher:
         Parameters
         ----------
         url         : Full URL to fetch
-        referer     : Referer header (optional, passed via custom_headers)
+        referer     : Referer header (optional, forwarded via custom_headers)
         ajax        : If True, add X-Requested-With: XMLHttpRequest
         timeout_ms  : API timeout in milliseconds
 
@@ -312,8 +312,10 @@ class ZenRowsFetcher:
         #
         # Only the successful configuration is charged.
         #
-        # For AJAX calls: add custom headers via custom_headers=true param.
-        # For floorplans.aspx: no JS rendering needed (server-side HTML).
+        # For AJAX calls: pass custom_headers=true (boolean toggle in query
+        # params) and send the actual header values as standard HTTP request
+        # headers on the requests.get() call. ZenRows forwards them to the
+        # target site.
 
         params: dict[str, str] = {
             "apikey": self._api_key,
@@ -326,18 +328,21 @@ class ZenRowsFetcher:
         if country:
             params["proxy_country"] = country
 
-        # For AJAX calls, pass custom headers
-        if ajax:
-            params["custom_headers"] = "true"
-            # ZenRows accepts custom headers via query params prefixed with
-            # "header_" — e.g., header_X-Requested-With=XMLHttpRequest
-            params["header_X-Requested-With"] = "XMLHttpRequest"
-            params["header_Accept"] = "text/html, */*; q=0.01"
-            if referer:
-                params["header_Referer"] = referer
-
         # Return original status code for debugging
         params["original_status"] = "true"
+
+        # For AJAX calls, pass custom headers.
+        # ZenRows API: set custom_headers=true in query params (boolean toggle),
+        # then pass the actual headers as standard HTTP request headers on the
+        # requests.get() call. ZenRows forwards these to the target site.
+        # Do NOT use header_X-Requested-With query params — that causes REQS004.
+        req_headers: dict[str, str] = {}
+        if ajax:
+            params["custom_headers"] = "true"
+            req_headers["X-Requested-With"] = "XMLHttpRequest"
+            req_headers["Accept"] = "text/html, */*; q=0.01"
+            if referer:
+                req_headers["Referer"] = referer
 
         import requests as _requests
 
@@ -349,6 +354,7 @@ class ZenRowsFetcher:
             resp = _requests.get(
                 self.API_URL,
                 params=params,
+                headers=req_headers,
                 timeout=api_timeout,
             )
         except _requests.exceptions.Timeout:
