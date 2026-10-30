@@ -453,7 +453,27 @@ class OurDomainScraper(AbstractScraper):
             fp_html = fetcher.fetch_html(floorplans_url)
             fp_ids = _extract_floorplan_ids(fp_html)
             if not fp_ids:
-                logger.warning("[%s] 未发现 floorplan id", display)
+                # Diagnostic logging: show what patterns ARE in the HTML
+                # to help identify why the regex didn't match.
+                has_subpointer = "subPointerId" in fp_html
+                has_myfloorplan = "myFloorPlanId" in fp_html
+                has_floorplan_selector = "floor-plan-selector" in fp_html
+                has_ffloorplan = "FFloorPlan" in fp_html
+                has_data_selenium = "data-selenium-id" in fp_html
+                # Check for JS-rendered floorplan data in script tags
+                has_fp_js = "floorPlan" in fp_html or "floorplan" in fp_html.lower()
+                logger.warning(
+                    "[%s] 未发现 floorplan id (html=%d chars). "
+                    "Patterns found: subPointerId=%s, myFloorPlanId=%s, "
+                    "floor-plan-selector=%s, FFloorPlan=%s, "
+                    "data-selenium-id=%s, floorPlan JS=%s. "
+                    "HTML first 1000 chars: %s",
+                    display, len(fp_html),
+                    has_subpointer, has_myfloorplan,
+                    has_floorplan_selector, has_ffloorplan,
+                    has_data_selenium, has_fp_js,
+                    fp_html[:1000],
+                )
                 return {}, False, {}
             fp_names_by_id = _extract_floorplan_names(fp_html)
             self._cache_floorplans(slug, fp_ids, fp_names_by_id)
@@ -717,12 +737,31 @@ def _headers_for(url: str, *, referer: str = "", ajax: bool = False) -> dict[str
 
 
 def _extract_floorplan_ids(html: str) -> list[str]:
-    # 有 two 种 RENTCafe FP id 格式：
-    #   subPointerId=NNNN          — photo gallery onclick（Diemen 在用）
-    #   myFloorPlanId=NNNN         — Get Notified / Contact Us 链接（South-East 在用）
+    # RENTCafe floorplan IDs can appear in several patterns depending on
+    # whether the HTML is server-side rendered (curl_cffi) or JS-rendered
+    # (BrightData with render=true, CloakBrowser):
+    #
+    #   subPointerId=NNNN          — photo gallery onclick (Diemen)
+    #   myFloorPlanId=NNNN         — Get Notified / Contact Us links (South-East)
+    #   data-floorplanid="NNNN"    — JS-hydrated floor-plan-selector elements
+    #   floorplanid=NNNN           — query-string in JS variable assignments
+    #   "floorPlanId":NNNN         — JSON in script tags (JS-rendered pages)
+    #   fpId\s*=\s*['"]?NNNN       — JS variable assignment
     ids = re.findall(r"subPointerId=(\d+)", html)
     if not ids:
         ids = re.findall(r"myFloorPlanId=(\d+)", html)
+    if not ids:
+        # JS-rendered HTML may use data attributes
+        ids = re.findall(r'data-floorplanid["\s]*=["\s]*(\d+)', html, re.I)
+    if not ids:
+        # JSON in script tags
+        ids = re.findall(r'"floorPlanId"\s*:\s*(\d+)', html, re.I)
+    if not ids:
+        # JS variable assignments
+        ids = re.findall(r'fpId\s*=\s*["\']?(\d+)', html, re.I)
+    if not ids:
+        # Generic floorplan id in query strings within JS
+        ids = re.findall(r'floorplanid=(\d+)', html, re.I)
     return list(dict.fromkeys(ids))
 
 

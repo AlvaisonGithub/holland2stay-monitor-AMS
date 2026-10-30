@@ -443,12 +443,64 @@ class BrightDataFetcher:
                 "Web Unlocker may not be able to bypass this CF level."
             )
 
+        # If target returned a server error (5xx), retry once without
+        # x-unblock-expect header. The expect header can sometimes cause
+        # the target server to return errors if the expected elements
+        # trigger unusual behavior. Retrying without it lets BrightData
+        # use its default behavior.
+        if isinstance(target_status, int) and target_status >= 500 and not ajax:
+            logger.info(
+                "BrightData: target returned %d, retrying without x-unblock-expect for %s",
+                target_status, url,
+            )
+            # Retry without expect header
+            retry_headers = dict(api_headers)
+            retry_headers.pop("x-unblock-expect", None)
+            try:
+                retry_resp = _requests.post(
+                    self.API_URL,
+                    headers=retry_headers,
+                    json=payload,
+                    timeout=api_timeout,
+                )
+            except Exception as retry_err:
+                logger.warning("BrightData retry failed: %s", retry_err)
+            else:
+                retry_elapsed = time.monotonic() - start
+                if retry_resp.status_code < 400:
+                    try:
+                        retry_data = retry_resp.json()
+                        retry_status = retry_data.get("status_code", 0)
+                        retry_html = retry_data.get("body", "")
+                        if retry_status < 500 and len(retry_html) > 200:
+                            # Retry succeeded!
+                            logger.info(
+                                "BrightData retry OK: target_status=%s, %.1fs, %d chars for %s",
+                                retry_status, retry_elapsed, len(retry_html), url,
+                            )
+                            _consume_credit(1)  # pay for the retry too
+                            html = retry_html
+                            target_status = retry_status
+                            elapsed = retry_elapsed
+                    except Exception:
+                        pass
+
         # Check for empty or suspiciously short responses
         if len(html) < 200:
             logger.warning(
                 "BrightData returned very short response (%d chars) for %s. "
                 "Content: %s",
                 len(html), url, html[:200],
+            )
+
+        # If target returned a server error (5xx), log it prominently.
+        # BrightData successfully reached the target but the target itself
+        # returned an error. This is NOT a BrightData failure.
+        if isinstance(target_status, int) and target_status >= 500:
+            logger.warning(
+                "BrightData: target server returned HTTP %d for %s "
+                "(%.1fs, %d chars). Target may be down or blocking BrightData's proxy.",
+                target_status, url, elapsed, len(html),
             )
 
         logger.debug(
