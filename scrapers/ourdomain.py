@@ -568,7 +568,24 @@ class OurDomainScraper(AbstractScraper):
                     exc_info=True,
                 )
                 continue
-            for unit in _extract_units(unit_html):
+            units_found = _extract_units(unit_html)
+            if units_found:
+                logger.info(
+                    "[%s] fp_id=%s: %d units found (%d chars)",
+                    display, fp_id, len(units_found), len(unit_html),
+                )
+            else:
+                # Log when no units found for debugging — could be genuinely
+                # no availability, or could be HTML structure change.
+                has_unitrow = "unitrow" in unit_html
+                has_no_units = "no units" in unit_html.lower() or "no available" in unit_html.lower()
+                logger.debug(
+                    "[%s] fp_id=%s: 0 units (html=%d chars, "
+                    "unitrow=%s, no_units_msg=%s)",
+                    display, fp_id, len(unit_html),
+                    has_unitrow, has_no_units,
+                )
+            for unit in units_found:
                 _merge_unit(all_units, unit, fp_id)
         return all_units, complete, fp_names_by_id
 
@@ -810,6 +827,10 @@ def _extract_floorplan_ids(html: str) -> list[str]:
     #   floorplanid=NNNN           — query-string in JS variable assignments
     #   "floorPlanId":NNNN         — JSON in script tags (JS-rendered pages)
     #   fpId\s*=\s*['"]?NNNN       — JS variable assignment
+    #   olePropertyID=NNNN         — property ID (not floorplan, excluded)
+    #
+    # Also try a broader search for 7-digit IDs near floorplan-related keywords
+    # as a last resort (JS-rendered pages may embed IDs in unexpected places).
     ids = re.findall(r"subPointerId=(\d+)", html)
     if not ids:
         ids = re.findall(r"myFloorPlanId=(\d+)", html)
@@ -828,6 +849,23 @@ def _extract_floorplan_ids(html: str) -> list[str]:
     if not ids:
         # Generic floorplan id in query strings within JS
         ids = re.findall(r'floorplanid=(\d+)', html, re.I)
+    if not ids:
+        # Fallback: look for IDs in data-attributes or onclick with
+        # "availableunits" or "floorplan" context (broader pattern)
+        # This catches cases where JS rendering changed the attribute name
+        # but the ID is still near floorplan-related keywords.
+        # Pattern: any 6-8 digit number near "floorPlan" or "availableunits"
+        # or "Get Notified" in a 200-char window.
+        for m in re.finditer(
+            r'(?:floorPlan|availableunits|Get\s+Notified|showDialog)',
+            html, re.I,
+        ):
+            window = html[m.start():m.start() + 300]
+            fp_match = re.findall(r'\b(\d{6,8})\b', window)
+            if fp_match:
+                # Filter out property IDs (typically 6 digits, but floorplan
+                # IDs are 7 digits for OurDomain). Keep all and dedupe later.
+                ids.extend(fp_match)
     return list(dict.fromkeys(ids))
 
 
