@@ -162,7 +162,7 @@ class OurDomainScraper(AbstractScraper):
     # 街道地址（地图上同一个 pin），符合"同栋楼"的物理事实。
     BUILDINGS: dict[str, dict[str, str]] = {
         "diemen": {
-            "slug": "ourdomain-amsterdam-diemen",
+            "slug": "ourdomain-amsterdam-diemen2",
             "display": "Amsterdam Diemen",
             "short_display": "Diemen",
             "property_id": "184283",
@@ -197,6 +197,11 @@ class OurDomainScraper(AbstractScraper):
         self._browser_created_at: float = 0.0
         # BrightData fetcher (created lazily when needed)
         self._brightdata_fetcher: Optional["BrightDataFetcher"] = None
+        # ZenRows fetcher (fallback when BrightData KYC blocks the domain)
+        self._zenrows_fetcher: Optional["ZenRowsFetcher"] = None
+        # BrightData KYC blacklist — set when BrightData returns KYC error
+        # for this session, so _get_fetcher skips BrightData and uses ZenRows
+        self._brightdata_kyc_blocked: bool = False
 
     @staticmethod
     def _fp_cache_key(base: str, slug: str) -> str:
@@ -225,12 +230,13 @@ class OurDomainScraper(AbstractScraper):
 
         Priority:
         1. BrightData API (if BRIGHTDATA_API_KEY is set) — handles WAF + JS challenge
-        2. CloakBrowser (fallback) — only handles JS challenge, not WAF
+        2. ZenRows API (if ZENROWS_API_KEY is set) — no KYC, no robots.txt check
+        3. CloakBrowser (fallback) — only handles JS challenge, not WAF
 
         Returns a fetcher object with fetch_html(url, referer, ajax) interface.
         """
-        # Try BrightData first
-        if self._brightdata_fetcher is None:
+        # Try BrightData first (skip if KYC-blocked for this session)
+        if not self._brightdata_kyc_blocked and self._brightdata_fetcher is None:
             try:
                 from .brightdata_fetcher import BrightDataFetcher
                 bd = BrightDataFetcher(headless=CLOAKBROWSER_HEADLESS)
@@ -240,10 +246,26 @@ class OurDomainScraper(AbstractScraper):
             except ImportError:
                 pass
 
-        if self._brightdata_fetcher is not None:
+        if not self._brightdata_kyc_blocked and self._brightdata_fetcher is not None:
             if not self._brightdata_fetcher.is_initialized:
                 self._brightdata_fetcher.ensure_initialized(entry_url)
             return self._brightdata_fetcher
+
+        # Try ZenRows (fallback when BrightData not configured or KYC-blocked)
+        if self._zenrows_fetcher is None:
+            try:
+                from .zenrows_fetcher import ZenRowsFetcher
+                zr = ZenRowsFetcher(headless=CLOAKBROWSER_HEADLESS)
+                if zr.is_configured:
+                    self._zenrows_fetcher = zr
+                    logger.info("Using ZenRows Fetch API for CF bypass")
+            except ImportError:
+                pass
+
+        if self._zenrows_fetcher is not None:
+            if not self._zenrows_fetcher.is_initialized:
+                self._zenrows_fetcher.ensure_initialized(entry_url)
+            return self._zenrows_fetcher
 
         # Fall back to CloakBrowser
         return self._ensure_browser(entry_url)
@@ -292,9 +314,11 @@ class OurDomainScraper(AbstractScraper):
                 pass
             self._browser_fetcher = None
             self._browser_origin = None
-        # BrightData fetcher is stateless, just drop the reference
+        # BrightData/ZenRows fetchers are stateless, just drop the reference
         # (no resources to release)
         self._brightdata_fetcher = None
+        self._zenrows_fetcher = None
+        self._brightdata_kyc_blocked = False
 
     @contextmanager
     def batch_session(self):
@@ -390,9 +414,9 @@ class OurDomainScraper(AbstractScraper):
                     f"curl_cffi 已试指纹: {', '.join(tried)}。"
                     "解决方案：1) 设置 BRIGHTDATA_API_KEY（免费 5000 请求/月，"
                     "注册：https://brightdata.com/products/web-unlocker）；"
-                    "2) 如果 BrightData 报 KYC 错误，尝试账号验证："
-                    "https://brightdata.com/cp/account_verification"
-                    "（个人用户可能可以通过，无需企业信息）；"
+                    "2) 如果 BrightData 报 KYC 错误，设置 ZENROWS_API_KEY"
+                    "（免费 5000 credits/月，无需 KYC，不检查 robots.txt，"
+                    "注册：https://app.zenrows.com/register）；"
                     "3) 更换 HTTPS_PROXY 出口 IP。"
                 ) from last_blocked
 
@@ -414,6 +438,7 @@ class OurDomainScraper(AbstractScraper):
             display,
             "OurDomain",
             "brightdata" if last_blocked is not None and self._brightdata_fetcher is not None
+            else "zenrows" if last_blocked is not None and self._zenrows_fetcher is not None
             else "browser" if last_blocked is not None
             else f"curl_cffi/{impersonate}" if tried else "none",
             len(listings),
@@ -437,8 +462,8 @@ class OurDomainScraper(AbstractScraper):
         未配置时回退到 CloakBrowser（仅能处理 JS challenge）。
 
         如果 BrightData 返回 KYC 错误（某些域名需要住宅代理，免费版无 KYC
-        无法使用），自动切换到 CloakBrowser 尝试。CloakBrowser 可能无法
-        绕过 WAF firewall，但值得一试。
+        无法使用），自动切换到 ZenRows API（无需 KYC，不检查 robots.txt）。
+        如果 ZenRows 也失败，最后回退到 CloakBrowser（仅 JS challenge）。
 
         Floorplan ID 缓存
         ------------------
@@ -461,16 +486,29 @@ class OurDomainScraper(AbstractScraper):
                 fp_html = fetcher.fetch_html(floorplans_url)
             except BlockedError as e:
                 # Check if this is a KYC/residential restriction error
-                # from BrightData. If so, try CloakBrowser as fallback.
+                # from BrightData. If so, try ZenRows first (no KYC needed),
+                # then CloakBrowser as last resort.
                 if "KYC" in str(e) or "residential" in str(e).lower():
                     logger.warning(
-                        "[%s] BrightData KYC 限制，切换到 CloakBrowser 尝试: %s",
+                        "[%s] BrightData KYC 限制，切换到 ZenRows: %s",
                         display, e,
                     )
-                    # Drop BrightData fetcher and try CloakBrowser
+                    # Blacklist BrightData for this session and drop the fetcher
+                    self._brightdata_kyc_blocked = True
                     self._brightdata_fetcher = None
-                    fetcher = self._ensure_browser(floorplans_url)
-                    fp_html = fetcher.fetch_html(floorplans_url)
+                    # Try ZenRows (will be picked up by _get_fetcher)
+                    fetcher = self._get_fetcher(floorplans_url)
+                    try:
+                        fp_html = fetcher.fetch_html(floorplans_url)
+                    except BlockedError as e2:
+                        # ZenRows also failed — try CloakBrowser as last resort
+                        logger.warning(
+                            "[%s] ZenRows 也失败，切换到 CloakBrowser: %s",
+                            display, e2,
+                        )
+                        self._zenrows_fetcher = None
+                        fetcher = self._ensure_browser(floorplans_url)
+                        fp_html = fetcher.fetch_html(floorplans_url)
                 else:
                     raise
             fp_ids = _extract_floorplan_ids(fp_html)
