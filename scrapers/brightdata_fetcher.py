@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -207,17 +208,51 @@ class BrightDataFetcher:
 
     # ── CF challenge detection ───────────────────────────────────────
     def _is_cf_challenge(self, html: str) -> bool:
-        """Check if returned HTML is a Cloudflare challenge/block page."""
+        """
+        Check if returned HTML is a Cloudflare challenge/block page.
+
+        Important: RENTCafe pages served through Cloudflare include
+        ``/cdn-cgi/challenge-platform/`` script references even on the
+        REAL page (after CF passes). We must NOT flag those as challenge
+        pages. Only flag pages whose <title> or body content clearly
+        indicates a CF interstitial/challenge page.
+
+        False positives would discard 27K+ chars of valid RENTCafe HTML!
+        """
+        if not html or len(html) < 20:
+            return False
+
         lower = html.lower()
-        return (
-            "just a moment" in lower
-            or "请稍候" in html
-            or "challenge-platform" in lower
-            or "cf-turnstile" in lower
-            or "attention required" in lower
-            or "cf.errors.css" in lower
-            or "you have been blocked" in lower
-        )
+
+        # Strong signals: these only appear on actual CF challenge pages
+        # Check the <title> tag — CF challenge pages have distinctive titles
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        title = title_match.group(1).strip().lower() if title_match else ""
+
+        if "just a moment" in title:
+            return True
+        if "attention required" in title and "cloudflare" in title:
+            return True
+        if "请稍候" in title:
+            return True
+
+        # Body-level strong signals (not just script references)
+        # "cf.errors.css" only appears on CF block pages
+        if "cf.errors.css" in lower:
+            return True
+
+        # "you have been blocked" in the visible body (not script)
+        if "you have been blocked" in lower and "ray id" in lower:
+            return True
+
+        # cf-turnstile as the MAIN content (not just a reference in a script)
+        # Real pages may reference turnstile in scripts but don't have the
+        # visible turnstile widget as primary content
+        if "cf-turnstile" in lower and len(html) < 5000:
+            # Short page with turnstile = likely challenge page
+            return True
+
+        return False
 
     # ── HTML fetch ───────────────────────────────────────────────────
     def fetch_html(
@@ -443,47 +478,78 @@ class BrightDataFetcher:
                 "Web Unlocker may not be able to bypass this CF level."
             )
 
-        # If target returned a server error (5xx), retry once without
-        # x-unblock-expect header. The expect header can sometimes cause
-        # the target server to return errors if the expected elements
-        # trigger unusual behavior. Retrying without it lets BrightData
-        # use its default behavior.
+        # If target returned a server error (5xx), try alternative strategies.
+        # The 502 might be from:
+        # 1. The x-unblock-expect header triggering server-side errors
+        # 2. The render=true causing a timeout on the target's backend
+        # 3. The NL country code causing geo-blocking on the target
+        # Try: no-expect → no-render → different-country
         if isinstance(target_status, int) and target_status >= 500 and not ajax:
-            logger.info(
-                "BrightData: target returned %d, retrying without x-unblock-expect for %s",
-                target_status, url,
-            )
-            # Retry without expect header
-            retry_headers = dict(api_headers)
-            retry_headers.pop("x-unblock-expect", None)
-            try:
-                retry_resp = _requests.post(
-                    self.API_URL,
-                    headers=retry_headers,
-                    json=payload,
-                    timeout=api_timeout,
+            retry_strategies = [
+                # Strategy 1: Remove x-unblock-expect (let BrightData auto-handle)
+                ("no-expect", {**payload}, {k: v for k, v in api_headers.items() if k != "x-unblock-expect"}),
+                # Strategy 2: Remove render (faster, might avoid backend timeout)
+                ("no-render", {k: v for k, v in payload.items() if k != "render"},
+                 {k: v for k, v in api_headers.items() if k != "x-unblock-expect"}),
+                # Strategy 3: Try US country (different proxy pool)
+                ("us-country", {**{k: v for k, v in payload.items() if k != "render"}, "country": "us"},
+                 {k: v for k, v in api_headers.items() if k != "x-unblock-expect"}),
+            ]
+
+            for strategy_name, retry_payload, retry_hdrs in retry_strategies:
+                if not is_credit_available():
+                    break
+                logger.info(
+                    "BrightData: target returned %d, retrying with strategy=%s for %s",
+                    target_status, strategy_name, url,
                 )
-            except Exception as retry_err:
-                logger.warning("BrightData retry failed: %s", retry_err)
-            else:
+                try:
+                    retry_resp = _requests.post(
+                        self.API_URL,
+                        headers=retry_hdrs,
+                        json=retry_payload,
+                        timeout=api_timeout,
+                    )
+                except Exception as retry_err:
+                    logger.warning("BrightData retry (%s) failed: %s", strategy_name, retry_err)
+                    continue
+
+                if retry_resp.status_code >= 400:
+                    logger.warning(
+                        "BrightData retry (%s) API error %d for %s",
+                        strategy_name, retry_resp.status_code, url,
+                    )
+                    _consume_credit(1)
+                    continue
+
+                try:
+                    retry_data = retry_resp.json()
+                    retry_status = retry_data.get("status_code", 0)
+                    retry_html = retry_data.get("body", "")
+                except Exception:
+                    retry_status = 0
+                    retry_html = retry_resp.text
+
                 retry_elapsed = time.monotonic() - start
-                if retry_resp.status_code < 400:
-                    try:
-                        retry_data = retry_resp.json()
-                        retry_status = retry_data.get("status_code", 0)
-                        retry_html = retry_data.get("body", "")
-                        if retry_status < 500 and len(retry_html) > 200:
-                            # Retry succeeded!
-                            logger.info(
-                                "BrightData retry OK: target_status=%s, %.1fs, %d chars for %s",
-                                retry_status, retry_elapsed, len(retry_html), url,
-                            )
-                            _consume_credit(1)  # pay for the retry too
-                            html = retry_html
-                            target_status = retry_status
-                            elapsed = retry_elapsed
-                    except Exception:
-                        pass
+                _consume_credit(1)
+
+                logger.info(
+                    "BrightData retry (%s): target_status=%s, %.1fs, %d chars for %s",
+                    strategy_name, retry_status or "?", retry_elapsed, len(retry_html), url,
+                )
+
+                if retry_status and retry_status < 500 and len(retry_html) > 200:
+                    # Retry succeeded!
+                    html = retry_html
+                    target_status = retry_status
+                    elapsed = retry_elapsed
+                    logger.info("BrightData retry (%s) succeeded for %s", strategy_name, url)
+                    break
+                else:
+                    logger.warning(
+                        "BrightData retry (%s) still failing: target_status=%s, %d chars",
+                        strategy_name, retry_status or "?", len(retry_html),
+                    )
 
         # Check for empty or suspiciously short responses
         if len(html) < 200:

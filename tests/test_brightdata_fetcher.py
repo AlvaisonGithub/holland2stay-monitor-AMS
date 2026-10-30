@@ -96,20 +96,52 @@ class TestBrightDataFetcher:
             fetcher.fetch_html("https://example.com/test")
 
     def test_cf_challenge_detection(self, monkeypatch):
-        """_is_cf_challenge should detect various CF page types."""
+        """_is_cf_challenge should detect actual CF challenge pages but NOT
+        real pages that happen to include CF script references."""
         monkeypatch.setenv("BRIGHTDATA_API_KEY", "test_key")
         mod = _import_fetcher()
         fetcher = mod.BrightDataFetcher()
 
-        assert fetcher._is_cf_challenge("Just a moment...") is True
-        assert fetcher._is_cf_challenge("请稍候…") is True
-        assert fetcher._is_cf_challenge('<html>challenge-platform</html>') is True
-        assert fetcher._is_cf_challenge("Attention Required! | Cloudflare") is True
-        assert fetcher._is_cf_challenge("you have been blocked") is True
+        # Real CF challenge pages — detected by <title> tag
+        assert fetcher._is_cf_challenge(
+            '<html><head><title>Just a moment...</title></head><body>challenge-platform</body></html>'
+        ) is True
+        assert fetcher._is_cf_challenge(
+            '<html><head><title>Attention Required! | Cloudflare</title></head></html>'
+        ) is True
+        assert fetcher._is_cf_challenge(
+            '<html><head><title>请稍候…</title></head></html>'
+        ) is True
+        # CF block page with cf.errors.css
+        assert fetcher._is_cf_challenge(
+            '<html><head><link rel="stylesheet" href="/cdn-cgi/styles/cf.errors.css"></head></html>'
+        ) is True
+        # "You have been blocked" with ray ID
+        assert fetcher._is_cf_challenge(
+            '<html><body>You have been blocked. Ray ID: abc123</body></html>'
+        ) is True
+        # Short page with turnstile (likely challenge)
+        assert fetcher._is_cf_challenge(
+            '<html><body><div class="cf-turnstile"></div></body></html>'
+        ) is True
 
-        # Normal pages should not be flagged
+        # Real RENTCafe page with CF script references — should NOT be flagged
+        # This is the key test: RENTCafe pages include /cdn-cgi/challenge-platform/
+        # scripts even after CF passes, but they are NOT challenge pages.
+        rentcafe_html = (
+            '<!doctype html><html lang="en">'
+            '<head><title>RENTCafe - We Make Renting Easy</title>'
+            '<script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js"></script>'
+            '</head><body><div id="FFloorPlan">Floor plans here</div></body></html>'
+        )
+        assert fetcher._is_cf_challenge(rentcafe_html) is False
+
+        # Other normal pages
         assert fetcher._is_cf_challenge("<html><body>Normal page</body></html>") is False
         assert fetcher._is_cf_challenge("Available Units") is False
+        # Empty/short strings
+        assert fetcher._is_cf_challenge("") is False
+        assert fetcher._is_cf_challenge("ab") is False
 
     def test_close_is_noop(self, monkeypatch):
         """close() should be a no-op (no browser resources)."""
@@ -206,10 +238,12 @@ class TestBrightDataFetcher:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         # format=json returns {status_code, headers, body}
+        # Use a real CF challenge page with <title>Just a moment...</title>
         mock_resp.json.return_value = {
             "status_code": 403,
             "headers": {},
-            "body": "Just a moment... <!-- challenge-platform -->",
+            "body": "<html><head><title>Just a moment...</title></head>"
+                    "<body><!-- challenge-platform --></body></html>",
         }
         mock_resp.headers = {}
         mock_post.return_value = mock_resp
