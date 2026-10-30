@@ -264,3 +264,37 @@ class TestBrightDataFetcher:
         from scrapers.base import BlockedError
         with pytest.raises(BlockedError, match="CF challenge page"):
             fetcher.fetch_html("https://example.com/test")
+
+    @patch("requests.post")
+    def test_kyc_error_raises_blocked(self, mock_post, monkeypatch):
+        """If BrightData returns a KYC/residential restriction error,
+        raise BlockedError with a helpful message."""
+        monkeypatch.setenv("BRIGHTDATA_API_KEY", "test_key")
+        monkeypatch.setenv("BRIGHTDATA_MONTHLY_CREDIT_LIMIT", "5000")
+        mod = _import_fetcher()
+        mod._credit_used = 0
+        mod._credit_month = mod._current_month()
+
+        # KYC error response — BrightData returns this when a domain
+        # requires residential proxies but the account has no KYC
+        kyc_body = (
+            '{"message": "Residential Failed (bad_endpoint): '
+            'Requested site is not available for immediate residential '
+            '(no KYC) access mode in accordance with robots.txt. '
+            'Visit https://brightdata.com/cp/kyc to verify."}'
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "status_code": 402,
+            "headers": {},
+            "body": kyc_body,
+        }
+        mock_resp.headers = {}
+        mock_post.return_value = mock_resp
+
+        fetcher = mod.BrightDataFetcher()
+        from scrapers.base import BlockedError
+        with pytest.raises(BlockedError, match="residential"):
+            fetcher.fetch_html("https://thisisourdomain.securerc.co.uk/test")

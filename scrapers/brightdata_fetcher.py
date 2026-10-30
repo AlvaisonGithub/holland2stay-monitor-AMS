@@ -602,14 +602,35 @@ class BrightDataFetcher:
 
         # Detect KYC requirement — BrightData's free tier (no KYC) blocks
         # residential proxy access to certain domains with restrictive
-        # robots.txt. This returns a 402 status with an error message.
-        if "kyc" in html.lower() and "brightdata.com/cp/kyc" in html.lower():
+        # robots.txt (Disallow: /). The Web Unlocker API automatically selects
+        # residential proxies for these domains, but since the account is in
+        # no-KYC mode, it returns an error instead.
+        #
+        # This is NOT something we can fix in code — it requires either:
+        # 1. KYC verification at brightdata.com/cp/kyc (requires business info)
+        # 2. Account verification at brightdata.com/cp/account_verification
+        #    (may be simpler, possibly works for individual users)
+        #
+        # We raise BlockedError so the scraper can catch it and try alternatives.
+        html_lower = html.lower()
+        is_kyc_error = (
+            ("kyc" in html_lower and "brightdata.com/cp/kyc" in html_lower)
+            or ("bad_endpoint" in html_lower and "robots.txt" in html_lower)
+            or ("not available for immediate" in html_lower and "residential" in html_lower)
+        )
+        if is_kyc_error:
             logger.error(
-                "BrightData KYC required for %s. This domain is blocked in "
-                "immediate residential (no KYC) mode. Fill in KYC form at "
-                "https://brightdata.com/cp/kyc to enable full residential access. "
-                "Response: %s",
+                "BrightData KYC/residential restriction for %s. "
+                "This domain requires residential proxies, which need KYC. "
+                "Options: 1) Verify account at https://brightdata.com/cp/account_verification "
+                "(may work for individual users), 2) Complete KYC at https://brightdata.com/cp/kyc "
+                "(requires business info). Response: %s",
                 url, html[:300],
+            )
+            raise _exc("BlockedError")(
+                f"BrightData cannot access {url} — domain requires residential "
+                "proxies (KYC required). This is a BrightData free tier limitation, "
+                "not a code bug."
             )
 
         # If target returned a server error (5xx), log it prominently.

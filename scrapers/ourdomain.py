@@ -388,9 +388,12 @@ class OurDomainScraper(AbstractScraper):
                 raise BlockedError(
                     f"[{display}] OurDomain curl_cffi + CF bypass 均被 403。"
                     f"curl_cffi 已试指纹: {', '.join(tried)}。"
-                    "解决方案：设置 BRIGHTDATA_API_KEY 环境变量（免费 5000 请求/月，"
-                    "无需信用卡，注册：https://brightdata.com/products/web-unlocker）。"
-                    "或更换 HTTPS_PROXY 出口 IP。"
+                    "解决方案：1) 设置 BRIGHTDATA_API_KEY（免费 5000 请求/月，"
+                    "注册：https://brightdata.com/products/web-unlocker）；"
+                    "2) 如果 BrightData 报 KYC 错误，尝试账号验证："
+                    "https://brightdata.com/cp/account_verification"
+                    "（个人用户可能可以通过，无需企业信息）；"
+                    "3) 更换 HTTPS_PROXY 出口 IP。"
                 ) from last_blocked
 
         listings = [
@@ -433,6 +436,10 @@ class OurDomainScraper(AbstractScraper):
         优先使用 BrightData Web Unlocker API（能处理 WAF firewall 级封锁），
         未配置时回退到 CloakBrowser（仅能处理 JS challenge）。
 
+        如果 BrightData 返回 KYC 错误（某些域名需要住宅代理，免费版无 KYC
+        无法使用），自动切换到 CloakBrowser 尝试。CloakBrowser 可能无法
+        绕过 WAF firewall，但值得一试。
+
         Floorplan ID 缓存
         ------------------
         floorplan IDs 变化频率极低（楼盘户型结构不变），缓存 12 小时。
@@ -450,7 +457,22 @@ class OurDomainScraper(AbstractScraper):
             fp_ids, fp_names_by_id = cached
             logger.debug("[%s] floorplan cache hit: %d IDs", display, len(fp_ids))
         else:
-            fp_html = fetcher.fetch_html(floorplans_url)
+            try:
+                fp_html = fetcher.fetch_html(floorplans_url)
+            except BlockedError as e:
+                # Check if this is a KYC/residential restriction error
+                # from BrightData. If so, try CloakBrowser as fallback.
+                if "KYC" in str(e) or "residential" in str(e).lower():
+                    logger.warning(
+                        "[%s] BrightData KYC 限制，切换到 CloakBrowser 尝试: %s",
+                        display, e,
+                    )
+                    # Drop BrightData fetcher and try CloakBrowser
+                    self._brightdata_fetcher = None
+                    fetcher = self._ensure_browser(floorplans_url)
+                    fp_html = fetcher.fetch_html(floorplans_url)
+                else:
+                    raise
             fp_ids = _extract_floorplan_ids(fp_html)
             if not fp_ids:
                 # Diagnostic logging: show what patterns ARE in the HTML
