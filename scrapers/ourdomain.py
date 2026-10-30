@@ -12,18 +12,33 @@ Floor-plan level availability is deliberately ignored because it can disagree
 with unit-level rows. Listings are keyed by physical unit ID and prefixed with
 ``od_`` so they cannot collide with Holland2Stay URL slugs.
 
-Cloudflare 403 处理策略（2026-10 修订）
----------------------------------------
-SecureRC 的 Cloudflare 保护已从 TLS fingerprint 级别升级到 JS challenge 级别，
-curl_cffi 的 TLS impersonation 已无法通过——无论换多少指纹都是 403。
+Cloudflare 403 处理策略（2026-10 修订 v2）
+------------------------------------------
+SecureRC 的 Cloudflare 保护已从 JS challenge 升级到 WAF firewall 级别。
+Railway 等 cloud IP 被 CF WAF firewall rules 直接 403，这是 IP 级封锁——
+CloakBrowser（patched Chromium）也无法绕过。
 
-抓取流程改为两阶段：
+抓取流程改为三阶段：
 1. **快速路径**：curl_cffi 尝试（个别 IP / 指纹仍可能通过，保留快速通道）
-2. **浏览器兜底**：curl_cffi 全指纹失败后，切换到 CloakBrowser（patched
-   Chromium），通过真实浏览器执行 JS challenge 后 fetch HTML
+2. **BrightData API 兜底**：curl_cffi 全指纹失败后，通过 BrightData Web
+   Unlocker API 获取 HTML。API 在 BrightData 的住宅代理网络上执行 CF
+   challenge solving + JS rendering + CAPTCHA solving，返回干净 HTML。
+   免费额度 5,000 请求/月，无需信用卡。
+3. **CloakBrowser 最后兜底**：如果 BrightData 未配置 API key，回退到
+   CloakBrowser（仅对 JS challenge 有效，对 WAF firewall 无效）。
 
-浏览器跨轮复用（与 H2S 同模式）：首轮创建后后续轮复用，避免每轮重新
-执行 CF challenge。仅在进程退出时关闭。
+BrightData 配置
+---------------
+环境变量::
+    BRIGHTDATA_API_KEY=xxx          # 从 brightdata.com 注册获取
+    BRIGHTDATA_ZONE=web_unlocker1   # zone 名称
+    BRIGHTDATA_MONTHLY_CREDIT_LIMIT=4500  # 月度额度上限（默认 4500，留 500 buffer）
+
+floorplan ID 缓存
+-----------------
+floorplan IDs 变化频率很低（楼盘户型结构基本不变），缓存后每轮只需
+fetch rcLoadContent.ashx（AJAX），不必重复 fetch floorplans.aspx。
+缓存有效期默认 12 小时，可通过 FLOORPLAN_CACHE_HOURS 环境变量调整。
 """
 from __future__ import annotations
 
@@ -165,18 +180,76 @@ class OurDomainScraper(AbstractScraper):
         },
     }
 
-    # ── 浏览器生命周期管理 ──────────────────────────────────────────
+    # ── 浏览器/BrightData 生命周期管理 ────────────────────────────────
     # CloakBrowser 跨轮复用——首轮创建后后续轮复用同一个实例，避免每轮
     # 重新执行 CF challenge。仅在进程退出或 BlockedError 时关闭重建。
     _BROWSER_MAX_AGE = 7200  # 2 小时
+
+    # ── Floorplan ID 缓存（跨轮复用，减少 API credit 消耗）────────────
+    # key: building slug (e.g. "ourdomain-amsterdam-diemen")
+    # value: (fp_ids, fp_names_by_id, timestamp)
+    _FP_CACHE: dict[str, tuple[list[str], dict[str, str], float]] = {}
+    _FP_CACHE_TTL = 43200  # 12 小时（秒）
 
     def __init__(self) -> None:
         self._browser_fetcher: Optional["RentCafeBrowserFetcher"] = None
         self._browser_origin: Optional[str] = None  # 限制同源复用
         self._browser_created_at: float = 0.0
+        # BrightData fetcher (created lazily when needed)
+        self._brightdata_fetcher: Optional["BrightDataFetcher"] = None
+
+    @staticmethod
+    def _fp_cache_key(base: str, slug: str) -> str:
+        """Generate cache key for floorplan cache."""
+        return f"{slug}"
+
+    @classmethod
+    def _get_cached_floorplans(cls, slug: str) -> Optional[tuple[list[str], dict[str, str]]]:
+        """Return cached floorplan IDs + names if still valid."""
+        entry = cls._FP_CACHE.get(slug)
+        if not entry:
+            return None
+        fp_ids, fp_names, cached_at = entry
+        if time.monotonic() - cached_at > cls._FP_CACHE_TTL:
+            return None  # expired
+        return fp_ids, fp_names
+
+    @classmethod
+    def _cache_floorplans(cls, slug: str, fp_ids: list[str], fp_names: dict[str, str]) -> None:
+        """Cache floorplan IDs + names."""
+        cls._FP_CACHE[slug] = (fp_ids, fp_names, time.monotonic())
+
+    def _get_fetcher(self, entry_url: str):
+        """
+        Get the appropriate fetcher for CF-protected RENTCafe URLs.
+
+        Priority:
+        1. BrightData API (if BRIGHTDATA_API_KEY is set) — handles WAF + JS challenge
+        2. CloakBrowser (fallback) — only handles JS challenge, not WAF
+
+        Returns a fetcher object with fetch_html(url, referer, ajax) interface.
+        """
+        # Try BrightData first
+        if self._brightdata_fetcher is None:
+            try:
+                from .brightdata_fetcher import BrightDataFetcher
+                bd = BrightDataFetcher(headless=CLOAKBROWSER_HEADLESS)
+                if bd.is_configured:
+                    self._brightdata_fetcher = bd
+                    logger.info("Using BrightData Web Unlocker for CF bypass (zone=%s)", bd._zone)
+            except ImportError:
+                pass
+
+        if self._brightdata_fetcher is not None:
+            if not self._brightdata_fetcher.is_initialized:
+                self._brightdata_fetcher.ensure_initialized(entry_url)
+            return self._brightdata_fetcher
+
+        # Fall back to CloakBrowser
+        return self._ensure_browser(entry_url)
 
     def _ensure_browser(self, entry_url: str) -> "RentCafeBrowserFetcher":
-        """懒创建或复用浏览器实例。BlockedError 后自动重建。"""
+        """懒创建或复用 CloakBrowser 实例。BlockedError 后自动重建。"""
         from .rentcafe_browser import RentCafeBrowserFetcher
         from urllib.parse import urlparse
 
@@ -211,7 +284,7 @@ class OurDomainScraper(AbstractScraper):
             raise
 
     def _close_browser(self) -> None:
-        """关闭浏览器，释放资源。"""
+        """关闭浏览器/BrightData fetcher，释放资源。"""
         if self._browser_fetcher is not None:
             try:
                 self._browser_fetcher.close()
@@ -219,18 +292,21 @@ class OurDomainScraper(AbstractScraper):
                 pass
             self._browser_fetcher = None
             self._browser_origin = None
+        # BrightData fetcher is stateless, just drop the reference
+        # (no resources to release)
+        self._brightdata_fetcher = None
 
     @contextmanager
     def batch_session(self):
         """
-        批次上下文：确保浏览器存活（如果已创建），dispatcher 通过此入口
-        拿到共享实例。浏览器跨轮复用——不再每批次创建/关闭。
+        批次上下文：确保 fetcher 存活（如果已创建），dispatcher 通过此入口
+        拿到共享实例。跨轮复用——不再每批次创建/关闭。
         """
         try:
             yield
         except (BlockedError,):
-            # CF 会话被标记不可复用：关闭当前浏览器，下轮重建
-            logger.warning("OurDomain 浏览器会话不可复用状态，关闭浏览器")
+            # CF 会话被标记不可复用：关闭当前 fetcher，下轮重建
+            logger.warning("OurDomain fetcher 会话不可复用状态，关闭")
             self._close_browser()
             raise
 
@@ -309,9 +385,11 @@ class OurDomainScraper(AbstractScraper):
             except BlockedError:
                 # 浏览器兜底也失败了 → 上抛最终错误
                 raise BlockedError(
-                    f"[{display}] OurDomain curl_cffi + CloakBrowser 均被 403。"
+                    f"[{display}] OurDomain curl_cffi + CF bypass 均被 403。"
                     f"curl_cffi 已试指纹: {', '.join(tried)}。"
-                    "可能需要更换出口 IP 或等待 Cloudflare 冷却。"
+                    "解决方案：设置 BRIGHTDATA_API_KEY 环境变量（免费 5000 请求/月，"
+                    "无需信用卡，注册：https://brightdata.com/products/web-unlocker）。"
+                    "或更换 HTTPS_PROXY 出口 IP。"
                 ) from last_blocked
 
         listings = [
@@ -331,7 +409,9 @@ class OurDomainScraper(AbstractScraper):
             "[%s] %s 抓取完成: method=%s, units=%d, complete=%s",
             display,
             "OurCampus" if task.source == "ourcampus" else "OurDomain",
-            "browser" if last_blocked is not None else f"curl_cffi/{impersonate}" if tried else "none",
+            "brightdata" if last_blocked is not None and self._brightdata_fetcher is not None
+            else "browser" if last_blocked is not None
+            else f"curl_cffi/{impersonate}" if tried else "none",
             len(listings),
             complete,
         )
@@ -347,27 +427,40 @@ class OurDomainScraper(AbstractScraper):
         move_in_date: str,
     ) -> tuple[dict[str, dict], bool, dict[str, str]]:
         """
-        CloakBrowser 兜底抓取：浏览器执行 CF challenge 后 fetch HTML。
+        CF bypass 抓取：通过 BrightData API 或 CloakBrowser 获取 HTML。
 
-        与 ``_scrape_once`` 逻辑相同，但 HTTP 请求走浏览器内 fetch()
-        而非 curl_cffi session。
+        优先使用 BrightData Web Unlocker API（能处理 WAF firewall 级封锁），
+        未配置时回退到 CloakBrowser（仅能处理 JS challenge）。
+
+        Floorplan ID 缓存
+        ------------------
+        floorplan IDs 变化频率极低（楼盘户型结构不变），缓存 12 小时。
+        命中缓存时跳过 floorplans.aspx 请求，节省 1 API credit。
         """
-        fetcher = self._ensure_browser(floorplans_url)
+        slug = floorplans_url.split("/")[-2] if "/" in floorplans_url else "default"
+        fetcher = self._get_fetcher(floorplans_url)
 
         all_units: dict[str, dict] = {}
         complete = True
 
-        # Phase 1: floorplans.aspx
-        fp_html = fetcher.fetch_html(floorplans_url)
-        fp_ids = _extract_floorplan_ids(fp_html)
-        if not fp_ids:
-            logger.warning("[%s] OurDomain (browser) 未发现 floorplan id", display)
-            return {}, False, {}
+        # Phase 1: floorplans.aspx (with caching)
+        cached = self._get_cached_floorplans(slug)
+        if cached:
+            fp_ids, fp_names_by_id = cached
+            logger.debug("[%s] floorplan cache hit: %d IDs", display, len(fp_ids))
+        else:
+            fp_html = fetcher.fetch_html(floorplans_url)
+            fp_ids = _extract_floorplan_ids(fp_html)
+            if not fp_ids:
+                logger.warning("[%s] 未发现 floorplan id", display)
+                return {}, False, {}
+            fp_names_by_id = _extract_floorplan_names(fp_html)
+            self._cache_floorplans(slug, fp_ids, fp_names_by_id)
+            logger.debug("[%s] floorplan cache miss: fetched %d IDs", display, len(fp_ids))
 
-        fp_names_by_id = _extract_floorplan_names(fp_html)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "[%s] OurDomain (browser) FP names: %d / %d",
+                "[%s] FP names: %d / %d",
                 display, len(fp_names_by_id), len(fp_ids),
             )
 
@@ -387,7 +480,7 @@ class OurDomainScraper(AbstractScraper):
             except Exception as e:
                 complete = False
                 logger.error(
-                    "[%s] OurDomain (browser) availableunits 失败 fp_id=%s: %s",
+                    "[%s] availableunits 失败 fp_id=%s: %s",
                     display, fp_id, e,
                     exc_info=True,
                 )

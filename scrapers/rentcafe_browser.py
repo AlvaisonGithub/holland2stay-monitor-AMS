@@ -118,12 +118,41 @@ class RentCafeBrowserFetcher:
         elif platform.system() == "Windows":
             chromium_args = ["--no-sandbox"]
 
+        # 如果配了 HTTPS_PROXY，让 Chromium 也走代理——避免 Railway 服务器 IP
+        # 被 CF WAF 直接拦截（IP 级封锁，浏览器也绕不过）。
+        proxy_url = ""
+        try:
+            from config import get_proxy_url as _get_proxy
+            proxy_url = _get_proxy() or ""
+        except Exception:
+            pass
+        if proxy_url:
+            # Chromium 的 --proxy-server 参数格式：
+            #   http://user:pass@host:port → --proxy-server=http://host:port
+            #  （认证通过 page.authenticate 处理，见下方）
+            # 去掉认证部分，只保留 scheme://host:port
+            from urllib.parse import urlparse
+            parsed_proxy = urlparse(proxy_url)
+            proxy_host = f"{parsed_proxy.scheme or 'http'}://{parsed_proxy.hostname}:{parsed_proxy.port}"
+            chromium_args.append(f"--proxy-server={proxy_host}")
+            logger.info("CloakBrowser using proxy: %s", proxy_host)
+
         self._browser = launch(
             headless=self._effective_headless,
             humanize=True,
             args=chromium_args,
         )
         self._page = self._browser.new_page()
+
+        # 如果代理需要认证，通过 page.authenticate 设置
+        if proxy_url:
+            from urllib.parse import urlparse
+            parsed_proxy = urlparse(proxy_url)
+            if parsed_proxy.username or parsed_proxy.password:
+                self._page.authenticate({
+                    "username": parsed_proxy.username or "",
+                    "password": parsed_proxy.password or "",
+                })
 
         # Extract origin from entry_url for same-origin validation
         from urllib.parse import urlparse

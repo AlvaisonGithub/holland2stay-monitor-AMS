@@ -119,4 +119,7 @@ def test_macos_headless_launch_uses_headed_directly(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0]["headless"] is False
-    assert calls[0]["args"] == []
+    # args may contain --proxy-server if get_proxy_url() returns one;
+    # the macOS test only cares about headless→headed switch, not proxy
+    args = calls[0]["args"]
+    assert all(a.startswith("--proxy-server=") or a in ("--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox") for a in args)
