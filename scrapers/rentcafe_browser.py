@@ -147,11 +147,14 @@ class RentCafeBrowserFetcher:
             ) from e
 
         # ── 等 Cloudflare JS challenge 完成 ───────────────────────────
-        # domcontentloaded 返回时页面可能还在 CF 挑战页（标题 "Just a
-        # moment..." / "请稍候…"）。CloakBrowser 的 patched Chromium 能自动
-        # 通过 managed challenge，但需要额外几秒让 JS 跑完。
+        # domcontentloaded 返回时页面可能还在 CF 挑战/拦截页。CF 有两种：
         #
-        # 等标题从 CF 挑战标题变成真实页面标题，最多等 30 秒。
+        # 1. JS challenge ("Just a moment..." / "请稍候…")：CloakBrowser 的
+        #    patched Chromium 能自动通过，需要等 JS 跑完（几秒到 30 秒）
+        # 2. WAF firewall 403 ("Attention Required! | Cloudflare")：硬拦截，
+        #    浏览器也无法通过，需要换 IP 或等 CF 冷却
+        #
+        # 等标题变成真实 RENTCafe 页面标题，排除所有 CF 相关标题。
         try:
             self._page.wait_for_function(
                 "() => {"
@@ -160,7 +163,9 @@ class RentCafeBrowserFetcher:
                 "    && t !== '请稍候…'"
                 "    && t !== '请稍候...'"
                 "    && !t.includes('moment')"
-                "    && !t.includes('稍候');"
+                "    && !t.includes('稍候')"
+                "    && !t.includes('Attention Required')"
+                "    && !t.toLowerCase().includes('cloudflare');"
                 "}",
                 timeout=30_000,
             )
@@ -170,7 +175,7 @@ class RentCafeBrowserFetcher:
                 cf_elapsed, self._page.title(),
             )
         except Exception:
-            # CF 挑战没在 30 秒内完成 — 检查是不是已经过了（有些页面标题不同）
+            # 30 秒后标题仍然是 CF 相关 — 检查页面内容确认
             try:
                 html = self._page.content()[:2000]
             except Exception:
@@ -179,7 +184,7 @@ class RentCafeBrowserFetcher:
             if self._is_cf_challenge(html):
                 self._initialized = False
                 raise _exc("BlockedError")(
-                    "RENTCafe page stuck on Cloudflare challenge after 30s wait. "
+                    "RENTCafe page stuck on Cloudflare challenge/block after 30s wait. "
                     "CloakBrowser may not be able to pass this challenge level."
                 )
 
@@ -229,13 +234,13 @@ class RentCafeBrowserFetcher:
 
     def _is_cf_challenge(self, html: str) -> bool:
         """
-        Check if page HTML is a Cloudflare challenge/interstitial page.
+        Check if page HTML is a Cloudflare challenge/interstitial/block page.
 
-        CF challenge pages have distinctive markers:
-        - Title "Just a moment..." / "请稍候…"
-        - CSP header referencing challenges.cloudflare.com
-        - challenge-platform script tag
-        - Meta refresh with long timeout
+        CF 有两种拦截页面：
+        1. JS challenge: 标题 "Just a moment..." / "请稍候…"，含
+           challenge-platform script + turnstile widget
+        2. WAF 403 block: 标题 "Attention Required! | Cloudflare"，含
+           cf.errors.css 引用 + "Sorry, you have been blocked"
 
         Normal RENTCafe pages also contain <!--[if lt IE 7]> conditional
         comments, so "no-js ie6 oldie" alone is NOT a reliable CF indicator.
@@ -246,6 +251,9 @@ class RentCafeBrowserFetcher:
             or "请稍候" in html
             or "challenge-platform" in lower
             or "cf-turnstile" in lower
+            or "attention required" in lower
+            or "cf.errors.css" in lower
+            or "you have been blocked" in lower
         )
 
     def _check_same_origin(self, url: str) -> None:

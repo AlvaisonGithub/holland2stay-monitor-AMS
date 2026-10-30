@@ -1118,10 +1118,29 @@ async def run_once(
             )
             return _unpack_scrape_result(result)
 
-        if other_tasks:
-            fresh_part, completeness_part = await _dispatch(other_tasks)
+        # OurDomain/OurCampus 现在也用 CloakBrowser 兜底（curl_cffi 403 时），
+        # 必须走隔离线程池，否则 Playwright Sync API 会拒绝启动
+        # ("It looks like you are using Playwright Sync API inside the asyncio loop")。
+        _BROWSER_SOURCES = {_H2S_SOURCE, "ourdomain", "ourcampus"}
+
+        # 按 source 分两批：需要浏览器的走隔离线程，其余走默认 executor
+        browser_tasks = [t for t in other_tasks if t.source in _BROWSER_SOURCES]
+        plain_tasks = [t for t in other_tasks if t.source not in _BROWSER_SOURCES]
+
+        if plain_tasks:
+            fresh_part, completeness_part = await _dispatch(plain_tasks)
             fresh_all.extend(fresh_part)
             completeness_all.update(completeness_part)
+
+        if browser_tasks:
+            try:
+                fresh_part, completeness_part = await _dispatch(browser_tasks, isolated=True)
+            except BlockedError as e:
+                # OurDomain/OurCampus 浏览器兜底全失败 — 记录但不影响其它 source
+                logger.warning("浏览器 source 抓取失败: %s", e)
+            else:
+                fresh_all.extend(fresh_part)
+                completeness_all.update(completeness_part)
 
         if selected_h2s:
             try:
