@@ -929,7 +929,7 @@ def load_config() -> Config:
     ValueError  若 TIMEZONE 不是合法的 IANA 时区标识符
     """
     interval = int(os.environ.get("CHECK_INTERVAL") or "300")
-    sources = _parse_sources(os.environ.get("SOURCES", "ourdomain,ourcampus,xior"))
+    sources = _parse_sources(os.environ.get("SOURCES", "holland2stay,ourdomain,ourcampus,xior"))
 
     cities: list[CityFilter] = []
     raw_cities = os.environ.get("CITIES", "Amsterdam,24")

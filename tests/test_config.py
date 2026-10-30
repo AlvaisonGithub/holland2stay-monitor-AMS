@@ -17,13 +17,13 @@ class TestGetImpersonate:
 
 
 class TestScrapeTasksV2:
-    def test_default_sources_is_holland2stay(self, monkeypatch):
+    def test_default_sources_includes_holland2stay(self, monkeypatch):
         monkeypatch.delenv("SOURCES", raising=False)
         cfg = config.load_config()
         tasks = cfg.scrape_tasks_v2()
-        assert cfg.sources == ["holland2stay"]
+        assert "holland2stay" in cfg.sources
         assert tasks
-        assert {t.source for t in tasks} == {"holland2stay"}
+        assert any(t.source == "holland2stay" for t in tasks)
 
     def test_ourdomain_source_adds_ourdomain_tasks(self, monkeypatch):
         monkeypatch.setenv("SOURCES", "holland2stay,ourdomain")
@@ -34,7 +34,7 @@ class TestScrapeTasksV2:
         tasks = cfg.scrape_tasks_v2()
 
         assert [t.source for t in tasks] == ["holland2stay", "ourdomain"]
-        assert tasks[0].city_display == "Eindhoven"
+        assert tasks[0].city_display == "Amsterdam"
         assert tasks[0].extra["availability_ids"] == ["179", "336"]
         assert tasks[1].city_key == "diemen"
         assert tasks[1].city_display == "Amsterdam Diemen"

@@ -72,6 +72,7 @@ class RentCafeBrowserFetcher:
         self._initialized = False
         self._effective_headless = headless
         self._origin: Optional[str] = None  # e.g. "https://thisisourdomain.securerc.co.uk"
+        self._entry_url: Optional[str] = None  # 原始 floorplans URL，用于 CF 重建
 
     # ── Context manager ──────────────────────────────────────────────
     def __enter__(self) -> "RentCafeBrowserFetcher":
@@ -91,6 +92,7 @@ class RentCafeBrowserFetcher:
             self._page = None
             self._initialized = False
             self._origin = None
+            self._entry_url = None
 
     # ── CF challenge initialization ──────────────────────────────────
     def ensure_initialized(self, entry_url: str) -> None:
@@ -113,6 +115,8 @@ class RentCafeBrowserFetcher:
         chromium_args = []
         if platform.system() == "Linux":
             chromium_args = ["--disable-dev-shm-usage", "--disable-gpu"]
+        elif platform.system() == "Windows":
+            chromium_args = ["--no-sandbox"]
 
         self._browser = launch(
             headless=self._effective_headless,
@@ -125,6 +129,7 @@ class RentCafeBrowserFetcher:
         from urllib.parse import urlparse
         parsed = urlparse(entry_url)
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
+        self._entry_url = entry_url  # 保存原始 URL，403 重建时用
 
         logger.info("RentCafeBrowserFetcher: navigating to %s (CF challenge)...", entry_url)
         start = time.monotonic()
@@ -141,14 +146,57 @@ class RentCafeBrowserFetcher:
                 f"RENTCafe page load failed (CF challenge may not have passed): {e}"
             ) from e
 
-        # Wait for the page to settle — RENTCafe floorplans page has unit table
-        # or floorplan selectors that only appear after CF + JS hydration.
-        # We use a pragmatic approach: wait for either the floorplan content or
-        # a timeout, then check if we're still on a CF challenge page.
+        # ── 等 Cloudflare JS challenge 完成 ───────────────────────────
+        # domcontentloaded 返回时页面可能还在 CF 挑战页（标题 "Just a
+        # moment..." / "请稍候…"）。CloakBrowser 的 patched Chromium 能自动
+        # 通过 managed challenge，但需要额外几秒让 JS 跑完。
+        #
+        # 等标题从 CF 挑战标题变成真实页面标题，最多等 30 秒。
+        try:
+            self._page.wait_for_function(
+                "() => {"
+                "  const t = document.title;"
+                "  return t !== 'Just a moment...'"
+                "    && t !== '请稍候…'"
+                "    && t !== '请稍候...'"
+                "    && !t.includes('moment')"
+                "    && !t.includes('稍候');"
+                "}",
+                timeout=30_000,
+            )
+            cf_elapsed = time.monotonic() - start
+            logger.info(
+                "CF challenge resolved (%.1fs), title: %r",
+                cf_elapsed, self._page.title(),
+            )
+        except Exception:
+            # CF 挑战没在 30 秒内完成 — 检查是不是已经过了（有些页面标题不同）
+            try:
+                html = self._page.content()[:2000]
+            except Exception:
+                html = ""
+
+            if self._is_cf_challenge(html):
+                self._initialized = False
+                raise _exc("BlockedError")(
+                    "RENTCafe page stuck on Cloudflare challenge after 30s wait. "
+                    "CloakBrowser may not be able to pass this challenge level."
+                )
+
+            # 不是 CF 挑战页但标题也没变 — 可能是特殊主题，继续执行
+            logger.warning(
+                "CF wait_for_function timed out but page is not CF challenge. "
+                "Proceeding. Title: %r, content (first 200): %s",
+                self._page.title(), html[:200],
+            )
+
+        # ── 等 RENTCafe 页面元素出现 ───────────────────────────────────
+        # CF 通过后，RENTCafe 的 JS 还需要几秒 hydrate 页面。等 unit 表格
+        # 或 floorplan 选择器出现。
         try:
             self._page.wait_for_selector(
                 '[data-selenium-id], .floor-plan-selector, #unitrow_',
-                timeout=30_000,
+                timeout=15_000,
             )
         except Exception:
             # Selector might not match all RENTCafe themes — check page content
@@ -160,7 +208,7 @@ class RentCafeBrowserFetcher:
             if self._is_cf_challenge(html):
                 self._initialized = False
                 raise _exc("BlockedError")(
-                    "RENTCafe page stuck on Cloudflare challenge after navigation"
+                    "RENTCafe page returned to CF challenge after initial pass"
                 )
 
             # If it's not a CF challenge, the page might just use different
@@ -180,13 +228,24 @@ class RentCafeBrowserFetcher:
         return self._initialized
 
     def _is_cf_challenge(self, html: str) -> bool:
-        """Check if page HTML is a Cloudflare challenge page."""
+        """
+        Check if page HTML is a Cloudflare challenge/interstitial page.
+
+        CF challenge pages have distinctive markers:
+        - Title "Just a moment..." / "请稍候…"
+        - CSP header referencing challenges.cloudflare.com
+        - challenge-platform script tag
+        - Meta refresh with long timeout
+
+        Normal RENTCafe pages also contain <!--[if lt IE 7]> conditional
+        comments, so "no-js ie6 oldie" alone is NOT a reliable CF indicator.
+        """
         lower = html.lower()
         return (
             "just a moment" in lower
+            or "请稍候" in html
             or "challenge-platform" in lower
-            or "cloudflare" in lower
-            or "no-js ie6 oldie" in html
+            or "cf-turnstile" in lower
         )
 
     def _check_same_origin(self, url: str) -> None:
@@ -231,7 +290,13 @@ class RentCafeBrowserFetcher:
         ScrapeNetworkError Network/timeout errors or non-OK responses
         """
         if not self._initialized:
-            self.ensure_initialized(url)
+            # 如果 url 是 AJAX endpoint（不是 floorplans.aspx），用已保存的
+            # entry_url 初始化；否则用 url 本身。
+            init_url = self._entry_url or url
+            if not init_url.endswith(".aspx") and ".ashx?" in init_url:
+                # entry_url 也可能是 AJAX URL（罕见），无法更好选择就直接用 url
+                init_url = url
+            self.ensure_initialized(init_url)
 
         self._check_same_origin(url)
 
@@ -296,7 +361,10 @@ class RentCafeBrowserFetcher:
             )
             self._initialized = False
             try:
-                self.ensure_initialized(url)
+                # 重建时导航到原始 floorplans URL（不是 AJAX endpoint），
+                # 这样才能正确触发并解决 CF challenge。
+                rebuild_url = self._entry_url or url
+                self.ensure_initialized(rebuild_url)
             except Exception:
                 raise _exc("BlockedError")(
                     "RENTCafe returned 403, CF session rebuild failed."

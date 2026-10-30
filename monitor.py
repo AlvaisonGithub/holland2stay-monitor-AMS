@@ -2075,8 +2075,17 @@ async def _async_main() -> None:
 
 
 def main() -> None:
-    # Windows 默认 ProactorEventLoop 与 asyncio.wait_for + Event.wait() 有兼容问题，
-    # 切换为 SelectorEventLoop 可避免超时时意外抛出 CancelledError。
+    # IMPORTANT: Do NOT enable WindowsSelectorEventLoopPolicy on Windows.
+    #
+    # The SelectorEventLoop on Windows does not support subprocess creation
+    # (asyncio.create_subprocess_exec raises NotImplementedError). CloakBrowser
+    # (Playwright Sync API) needs subprocess creation to launch Chromium.
+    #
+    # The default ProactorEventLoop on Windows supports subprocesses and works
+    # correctly with CloakBrowser. An earlier version of this code used
+    # SelectorEventLoop to work around asyncio.wait_for + Event.wait() issues,
+    # but that broke all CloakBrowser-based scrapers (H2S, RENTCafe fallback).
+    #
     #if sys.platform == "win32":
     #    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 

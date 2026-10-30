@@ -95,11 +95,17 @@ class BrowserFetcher:
         # - disable-dev-shm-usage: /dev/shm 默认 64MB，Chromium 会崩，改用 /tmp
         # - disable-gpu: headless 不需要 GPU 加速，避免无 GPU 环境报错
         #
+        # Windows 兼容参数：
+        # - no-sandbox: Windows 上 sandbox 偶尔会导致启动失败，禁用更稳定
+        #   (CloakBrowser patched Chromium 在 Windows 上已自带部分防护)
+        #
         # macOS 本地 CloakBrowser headless v145 存在 SIGABRT 风险；这些 Linux
         # 参数也不该无条件注入到本地调试浏览器。
         chromium_args = []
         if platform.system() == "Linux":
             chromium_args = ["--disable-dev-shm-usage", "--disable-gpu"]
+        elif platform.system() == "Windows":
+            chromium_args = ["--no-sandbox"]
 
         self._browser = launch(
             headless=self._effective_headless,
