@@ -263,7 +263,7 @@ class OurDomainScraper(AbstractScraper):
                 logger.info("RentCafe browser 已存活 %.0f 分钟，主动重建",
                             (now - self._browser_created_at) / 60)
                 self._close_browser()
-            # 不同源 → 不能复用（OurDomain Diemen vs South-East vs OurCampus）
+            # 不同源 → 不能复用（OurDomain Diemen vs South-East）
             elif self._browser_origin != origin:
                 logger.info("RentCafe browser 切换 origin: %s → %s",
                             self._browser_origin, origin)
@@ -412,7 +412,7 @@ class OurDomainScraper(AbstractScraper):
         logger.info(
             "[%s] %s 抓取完成: method=%s, units=%d, complete=%s",
             display,
-            "OurCampus" if task.source == "ourcampus" else "OurDomain",
+            "OurDomain",
             "brightdata" if last_blocked is not None and self._brightdata_fetcher is not None
             else "browser" if last_blocked is not None
             else f"curl_cffi/{impersonate}" if tried else "none",
@@ -479,6 +479,7 @@ class OurDomainScraper(AbstractScraper):
                 # to help identify why the regex didn't match.
                 has_subpointer = "subPointerId" in fp_html
                 has_myfloorplan = "myFloorPlanId" in fp_html
+                has_fp_detail = "FP_Detail_" in fp_html
                 has_floorplan_selector = "floor-plan-selector" in fp_html
                 has_ffloorplan = "FFloorPlan" in fp_html
                 has_data_selenium = "data-selenium-id" in fp_html
@@ -487,11 +488,12 @@ class OurDomainScraper(AbstractScraper):
                 logger.warning(
                     "[%s] 未发现 floorplan id (html=%d chars). "
                     "Patterns found: subPointerId=%s, myFloorPlanId=%s, "
-                    "floor-plan-selector=%s, FFloorPlan=%s, "
+                    "FP_Detail=%s, floor-plan-selector=%s, FFloorPlan=%s, "
                     "data-selenium-id=%s, floorPlan JS=%s. "
                     "HTML first 1000 chars: %s",
                     display, len(fp_html),
                     has_subpointer, has_myfloorplan,
+                    has_fp_detail,
                     has_floorplan_selector, has_ffloorplan,
                     has_data_selenium, has_fp_js,
                     fp_html[:1000],
@@ -765,6 +767,7 @@ def _extract_floorplan_ids(html: str) -> list[str]:
     #
     #   subPointerId=NNNN          — photo gallery onclick (Diemen)
     #   myFloorPlanId=NNNN         — Get Notified / Contact Us links (South-East)
+    #   FP_Detail_NNNN             — anchor href in floor-plan list (South-East v2)
     #   data-floorplanid="NNNN"    — JS-hydrated floor-plan-selector elements
     #   floorplanid=NNNN           — query-string in JS variable assignments
     #   "floorPlanId":NNNN         — JSON in script tags (JS-rendered pages)
@@ -772,6 +775,9 @@ def _extract_floorplan_ids(html: str) -> list[str]:
     ids = re.findall(r"subPointerId=(\d+)", html)
     if not ids:
         ids = re.findall(r"myFloorPlanId=(\d+)", html)
+    if not ids:
+        # South-East v2 theme: floor-plan list anchors use #FP_Detail_NNNN
+        ids = re.findall(r"FP_Detail_(\d+)", html)
     if not ids:
         # JS-rendered HTML may use data attributes
         ids = re.findall(r'data-floorplanid["\s]*=["\s]*(\d+)', html, re.I)
@@ -800,7 +806,7 @@ def _extract_floorplan_names(html: str) -> dict[str, str]:
        production server-side HTML 里 title 全是 ``"1"`` / ``"Max Rent"``
        等 UI 占位文本，不含 FP 名（浏览器里 JS 后期填的 tooltip）。
 
-    **真实可用 source**：每个 FP 的 floor-plan-selector anchor 都带：
+    **真实可用 source (Diemen 主题)**：每个 FP 的 floor-plan-selector anchor 都带：
 
         onclick="showDialog('Floor Plan Executive Studio | Furnished | Contract 1-5 years',
                             'photogallery',
@@ -810,10 +816,16 @@ def _extract_floorplan_names(html: str) -> dict[str, str]:
     的 ``subPointerId=NNN`` 是对应 FP 的数字 ID。这两者**强耦合在同一 anchor**，
     server-side rendered，跟 ``_extract_floorplan_ids`` 用的 anchor 是一回事。
 
+    **South-East v2 主题**：floor-plan list anchors 使用 ``#FP_Detail_NNNN``
+    作为 href，anchor 文本就是 FP 名：
+
+        <a href="...#FP_Detail_1101760">2 Bedroom Superior (monthly income required)</a>
+
     FP 名字里含 Occupancy 线索（Studio / 1-Bedroom / "1-person max"）——
     SecureRC 单元表本身没有 Beds 字段，只能从这里反推。
     """
     mapping: dict[str, str] = {}
+    # Strategy 1 (Diemen theme): showDialog('Floor Plan {name}' ... subPointerId=NNN)
     # 'Floor Plan {name}' ... subPointerId=NNN 之间允许 onclick 内任意其它参数
     # （photogallery / imagetype / galleryId 等）。[^>]*? 限制不跨越 tag 边界，
     # 避免误匹配下一个 anchor 的 subPointerId。
@@ -827,6 +839,20 @@ def _extract_floorplan_names(html: str) -> dict[str, str]:
         name = unescape(raw_name).strip()
         if name:
             mapping[fp_id] = name
+
+    # Strategy 2 (South-East v2 theme): <a href="...#FP_Detail_NNNN">{name}</a>
+    if not mapping:
+        pattern2 = re.compile(
+            r'href=["\'][^"\']*#FP_Detail_(\d+)["\'][^>]*>\s*([^<]+?)\s*</a>',
+            re.IGNORECASE,
+        )
+        for fp_id, raw_name in pattern2.findall(html):
+            if fp_id in mapping:
+                continue
+            name = unescape(raw_name).strip()
+            if name:
+                mapping[fp_id] = name
+
     return mapping
 
 

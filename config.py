@@ -353,10 +353,6 @@ KNOWN_OURDOMAIN_CITIES: list[dict] = [
     {"name": "Amsterdam South-East","key": "south-east"},
 ]
 
-KNOWN_OURCAMPUS_CITIES: list[dict] = [
-    {"name": "OurCampus Amsterdam Diemen", "key": "diemen"},
-]
-
 @dataclass
 class CityFilter:
     """GraphQL city filter 的单个城市条目。"""
@@ -381,11 +377,6 @@ class AvailabilityFilter:
 @dataclass
 class OurDomainCityFilter:
     """OurDomain / RENTCafe building filter 的单个条目。"""
-    name: str
-    key: str
-
-@dataclass
-class OurCampusCityFilter:
     name: str
     key: str
 
@@ -815,7 +806,6 @@ class Config:
     heartbeat_interval_minutes: int = 60
     sources: list[str] = field(default_factory=lambda: ["holland2stay"])
     ourdomain_cities: list[OurDomainCityFilter] = field(default_factory=list)
-    ourcampus_cities: list[OurCampusCityFilter] = field(default_factory=list)
     xior_cities: list[XiorCityFilter] = field(default_factory=list)
 
     def scrape_tasks_v2(self) -> list["ScrapeTask"]:  # type: ignore[name-defined]
@@ -860,16 +850,6 @@ class Config:
                 for c in self.ourdomain_cities
             )
 
-        if "ourcampus" in self.sources:
-            tasks.extend(
-                ScrapeTask(
-                    source="ourcampus",
-                    city_key=c.key,
-                    city_display=c.name,
-                )
-                for c in self.ourcampus_cities
-            )
-
         if "xior" in self.sources:
             tasks.extend(
                 ScrapeTask(
@@ -908,9 +888,6 @@ def _parse_name_key_list(raw: str, cls: type):
 def _parse_ourdomain_cities(raw: str) -> list[OurDomainCityFilter]:
     return _parse_name_key_list(raw, OurDomainCityFilter)
 
-def _parse_ourcampus_cities(raw: str) -> list[OurCampusCityFilter]:
-    return _parse_name_key_list(raw, OurCampusCityFilter)
-
 def _parse_xior_cities(raw: str) -> list[XiorCityFilter]:
     return _parse_name_key_list(raw, XiorCityFilter)
 
@@ -925,7 +902,6 @@ def load_config() -> Config:
     SOURCES                 逗号或 | 分隔，默认 "holland2stay"
     CITIES                  格式 "城市名,ID|城市名,ID"，默认 "Amsterdam,24"
     OURDOMAIN_CITIES        格式 "显示名,key|显示名,key"，启用 ourdomain 时默认 Amsterdam 
-    OURCAMPUS_CITIES        格式 "显示名,key|显示名,key"，启用 ourcampus 时默认 Amsterdam 
     XIOR_CITIES             格式 "显示名,key|显示名,key"，启用 xior 时默认 Amsterdam 
     AVAILABILITY_FILTERS    格式 "标签,ID|标签,ID"，默认包含 179 和 336
     DB_PATH                 str，默认 "data/listings.db"
@@ -947,7 +923,7 @@ def load_config() -> Config:
     ValueError  若 TIMEZONE 不是合法的 IANA 时区标识符
     """
     interval = int(os.environ.get("CHECK_INTERVAL") or "300")
-    sources = _parse_sources(os.environ.get("SOURCES", "holland2stay,ourdomain,ourcampus,xior"))
+    sources = _parse_sources(os.environ.get("SOURCES", "holland2stay,ourdomain,xior"))
 
     cities: list[CityFilter] = []
     raw_cities = os.environ.get("CITIES", "Amsterdam,24")
@@ -971,14 +947,6 @@ def load_config() -> Config:
     if "ourdomain" in sources:
         raw_od_cities = os.environ.get("OURDOMAIN_CITIES", "Amsterdam Diemen,diemen")
         ourdomain_cities = _parse_ourdomain_cities(raw_od_cities)
-
-    ourcampus_cities: list[OurCampusCityFilter] = []
-    if "ourcampus" in sources:
-        raw_oc_cities = os.environ.get(
-        "OURCAMPUS_CITIES",
-        "OurCampus Amsterdam Diemen,diemen",
-        )
-        ourcampus_cities = _parse_ourcampus_cities(raw_oc_cities)
 
     xior_cities: list[XiorCityFilter] = []
     if "xior" in sources:
@@ -1024,6 +992,5 @@ def load_config() -> Config:
         heartbeat_interval_minutes=max(0, int(os.environ.get("HEARTBEAT_INTERVAL_MINUTES") or "60")),
         sources=sources,
         ourdomain_cities=ourdomain_cities,
-        ourcampus_cities=ourcampus_cities,
         xior_cities=xior_cities,
     )

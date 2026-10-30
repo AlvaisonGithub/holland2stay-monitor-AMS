@@ -2,7 +2,7 @@
 scrapers/rentcafe_browser.py — CloakBrowser-based RENTCafe HTML fetcher
 =======================================================================
 
-SecureRC (securerc.co.uk) hosts RENTCafe endpoints for OurDomain, OurCampus,
+SecureRC (securerc.co.uk) hosts RENTCafe endpoints for OurDomain
 and Xior. Cloudflare has progressively tightened protection on these domains:
 - Pre-2026: curl_cffi TLS impersonation could pass (cookie-based soft retry)
 - 2026+: Cloudflare JS challenge (Turnstile-class) requires real browser JS

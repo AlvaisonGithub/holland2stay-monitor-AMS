@@ -43,7 +43,6 @@ from .base import (
 )
 from .holland2stay import HollandStayScraper
 from .ourdomain import OurDomainScraper
-from .ourcampus import OurCampusScraper
 from .xior import XiorScraper
 
 
@@ -53,7 +52,6 @@ SCRAPER_REGISTRY: dict[str, type[AbstractScraper]] = {
     cls.source: cls for cls in [
         HollandStayScraper,
         OurDomainScraper,
-        OurCampusScraper,
         XiorScraper,
     ]
 }
@@ -190,7 +188,6 @@ __all__ = [
     "BlockedError",
     "HollandStayScraper",
     "OurDomainScraper",
-    "OurCampusScraper",
     "XiorScraper",
     "ProxyError",
     "RateLimitError",

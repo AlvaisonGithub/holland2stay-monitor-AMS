@@ -13,7 +13,7 @@ from typing import Any
 from dotenv import dotenv_values
 from flask import Flask, flash, redirect, render_template, request, url_for
 
-from config import ENV_PATH, KNOWN_CITIES, KNOWN_OURCAMPUS_CITIES, KNOWN_OURDOMAIN_CITIES, KNOWN_XIOR_CITIES
+from config import ENV_PATH, KNOWN_CITIES, KNOWN_OURDOMAIN_CITIES, KNOWN_XIOR_CITIES
 
 from app.auth import admin_required
 from app.csrf import csrf_required
@@ -50,7 +50,7 @@ def settings() -> Any:
             ENV_PATH.touch()
 
         selected_sources = request.form.getlist("source_selected")
-        allowed_sources = {"holland2stay", "ourdomain", "ourcampus", "xior"}
+        allowed_sources = {"holland2stay", "ourdomain", "xior"}
         sources = [s for s in selected_sources if s in allowed_sources]
         if not sources:
             sources = ["holland2stay"]
@@ -66,14 +66,6 @@ def settings() -> Any:
         selected_od_cities = request.form.getlist("ourdomain_city_selected")
         od_cities_val = "|".join(selected_od_cities) if selected_od_cities else "Amsterdam Diemen,diemen"
         write_env_key("OURDOMAIN_CITIES", sanitize_dotenv(od_cities_val))
-
-        selected_oc_cities = request.form.getlist("ourcampus_city_selected")
-        oc_cities_val = (
-            "|".join(selected_oc_cities)
-            if selected_oc_cities
-            else "OurCampus Amsterdam Diemen,diemen"
-        )
-        write_env_key("OURCAMPUS_CITIES", sanitize_dotenv(oc_cities_val))
 
         selected_xr_cities = request.form.getlist("xior_city_selected")
         xr_cities_val = "|".join(selected_xr_cities) if selected_xr_cities else ""
@@ -97,7 +89,7 @@ def settings() -> Any:
             write_env_key(key, sanitized)
 
         logger.info(
-            "全局配置已保存 — sources=%s 间隔=%s 高峰=%s–%s(%s–%s/%s–%s) 仅工作日=%s 抖动=%s 心跳=%smin 日志=%s H2S城市=%s OD楼盘=%s",
+            "全局配置已保存 — sources=%s 间隔=%s 高峰=%s–%s(%s–%s/%s–%s) 仅工作日=%s 抖动=%s 心跳=%smin 日志=%s H2S城市=%s OD楼盘=%s XR楼盘=%s",
             sources_val,
             new_values.get("CHECK_INTERVAL", "?"),
             new_values.get("MIN_INTERVAL", "?"), new_values.get("PEAK_INTERVAL", "?"),
@@ -109,7 +101,6 @@ def settings() -> Any:
             new_values.get("LOG_LEVEL", "?"),
             cities_val,
             od_cities_val,
-            oc_cities_val,
             xr_cities_val
         )
 
@@ -124,7 +115,6 @@ def settings() -> Any:
         "SOURCES",
         "CITIES",
         "OURDOMAIN_CITIES",
-        "OURCAMPUS_CITIES",
         "XIOR_CITIES",
     ):
         if key in os.environ:
@@ -133,11 +123,11 @@ def settings() -> Any:
 
     selected_sources = {
         s.strip().lower()
-        for s in (env.get("SOURCES") or "ourdomain,xior,ourcampus").replace("|", ",").split(",")
+        for s in (env.get("SOURCES") or "ourdomain,xior").replace("|", ",").split(",")
         if s.strip()
     }
     if not selected_sources:
-        selected_sources = {"ourdomain", "xior", "ourcampus"}
+        selected_sources = {"ourdomain", "xior"}
 
     selected_city_ids: set[str] = set()
     for entry in env.get("CITIES", "Amsterdam,24").split("|"):
@@ -150,15 +140,6 @@ def settings() -> Any:
         parts = entry.strip().split(",")
         if len(parts) >= 2:
             selected_ourdomain_keys.add(parts[-1].strip())
-
-    selected_ourcampus_keys: set[str] = set()
-    for entry in env.get(
-            "OURCAMPUS_CITIES",
-            "OurCampus Amsterdam Diemen,diemen",
-        ).split("|"):
-        parts = entry.strip().split(",")
-        if len(parts) >= 2:
-            selected_ourcampus_keys.add(parts[-1].strip())
 
 
     selected_xior_keys: set[str] = set()
@@ -188,13 +169,11 @@ def settings() -> Any:
         known_cities=KNOWN_CITIES,
         known_ourdomain_cities=KNOWN_OURDOMAIN_CITIES,
         known_xior_cities=KNOWN_XIOR_CITIES,
-        known_ourcampus_cities=KNOWN_OURCAMPUS_CITIES,
         xior_by_city=xior_by_city,
         xior_city_all_checked=xior_city_all_checked,
         selected_sources=selected_sources,
         selected_city_ids=selected_city_ids,
         selected_ourdomain_keys=selected_ourdomain_keys,
-        selected_ourcampus_keys=selected_ourcampus_keys,
         selected_xior_keys=selected_xior_keys,
     )
 
