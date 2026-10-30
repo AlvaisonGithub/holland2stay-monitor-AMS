@@ -141,7 +141,13 @@ class TestBrightDataFetcher:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.text = "<html><body>Floor plans here</body></html>"
+        # format=json returns {status_code, headers, body}
+        mock_resp.json.return_value = {
+            "status_code": 200,
+            "headers": {"content-type": "text/html"},
+            "body": "<html><body>Floor plans here</body></html>",
+        }
+        mock_resp.headers = {}
         mock_post.return_value = mock_resp
 
         fetcher = mod.BrightDataFetcher()
@@ -155,12 +161,17 @@ class TestBrightDataFetcher:
         payload = call_args[1]["json"]
         assert payload["zone"] == "web_unlocker1"
         assert payload["url"] == "https://example.com/floorplans.aspx"
-        assert payload["format"] == "raw"
+        assert payload["format"] == "json"
         assert payload["method"] == "GET"
+        assert payload["render"] == "true"
 
         # Verify auth header
         headers = call_args[1]["headers"]
         assert headers["Authorization"] == "Bearer test_key_123"
+
+        # Verify x-unblock-expect is sent as HTTP header (not in payload body)
+        assert "x-unblock-expect" in headers
+        assert "headers" not in payload  # "headers" is NOT a valid body field
 
     @patch("requests.post")
     def test_402_raises_blocked_error(self, mock_post, monkeypatch):
@@ -175,6 +186,7 @@ class TestBrightDataFetcher:
         mock_resp.status_code = 402
         mock_resp.text = '{"message": "Credits exhausted"}'
         mock_resp.json.return_value = {"message": "Credits exhausted"}
+        mock_resp.headers = {}
         mock_post.return_value = mock_resp
 
         fetcher = mod.BrightDataFetcher()
@@ -193,7 +205,13 @@ class TestBrightDataFetcher:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.text = "Just a moment... <!-- challenge-platform -->"
+        # format=json returns {status_code, headers, body}
+        mock_resp.json.return_value = {
+            "status_code": 403,
+            "headers": {},
+            "body": "Just a moment... <!-- challenge-platform -->",
+        }
+        mock_resp.headers = {}
         mock_post.return_value = mock_resp
 
         fetcher = mod.BrightDataFetcher()

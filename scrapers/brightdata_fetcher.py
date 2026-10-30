@@ -238,10 +238,17 @@ class BrightDataFetcher:
         - Residential proxy rotation
         - JS rendering (enabled via render=true)
 
+        API body parameters (per docs.brightdata.com/api-reference):
+            zone, url, format, method, country, data_format, render, debug, async
+
+        Note: "headers" is NOT a valid body parameter. Custom headers go
+        via the x-unblock-custom-headers HTTP header on the API request.
+        x-unblock-expect is also an HTTP header, not a body field.
+
         Parameters
         ----------
         url         : Full URL to fetch
-        referer     : Referer header (optional, passed as custom header)
+        referer     : Referer header (optional, passed as custom header for AJAX)
         ajax        : If True, add X-Requested-With: XMLHttpRequest
         timeout_ms  : API timeout in milliseconds
 
@@ -276,18 +283,27 @@ class BrightDataFetcher:
 
         # Build request payload
         #
+        # Official API body parameters (per docs.brightdata.com/api-reference):
+        #   zone, url, format, method, country, data_format, render, debug, async
+        #
+        # NOTE: "headers" is NOT a valid body parameter. Custom headers/cookies
+        # are ignored by default unless "Custom Headers & Cookies" is enabled
+        # in the zone config. The API auto-generates optimal headers.
+        #
         # render=true: Force JS rendering via browser. RENTCafe floorplans.aspx
         # requires JS to fully render floorplan selectors. Without render=true,
         # the API may return a CF challenge page or an incomplete HTML.
         #
-        # x-unblock-expect: Wait for RENTCafe-specific elements before returning.
-        # This ensures the page is fully loaded, not just CF-cleared.
-        # For AJAX calls (rcLoadContent.ashx), we don't need to wait for elements
-        # since the response is server-generated HTML fragment.
+        # format=json: Returns {status_code, headers, body} instead of raw HTML.
+        # This lets us inspect the target's actual HTTP status code.
+        #
+        # x-unblock-expect: Sent as an HTTP header on the API request (NOT in
+        # the payload body). Tells the API to wait for specific CSS selectors
+        # before returning — ensures the page is fully loaded.
         payload: dict = {
             "zone": self._zone,
             "url": url,
-            "format": "raw",
+            "format": "json",  # Structured response with status_code + body
             "method": "GET",
             "render": "true",  # Force JS rendering — essential for CF challenge + RENTCafe JS
         }
@@ -297,28 +313,32 @@ class BrightDataFetcher:
         if country:
             payload["country"] = country
 
-        # For non-AJAX (page) requests, wait for RENTCafe elements to appear.
-        # This prevents getting an incomplete page back.
-        # x-unblock-expect uses CSS selectors to wait for content.
+        # Build HTTP headers for the API request itself.
+        # x-unblock-expect goes here (as an HTTP header), NOT in the payload body.
+        api_headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+
         if not ajax:
-            # Wait for floorplan-related elements that appear after JS hydration
-            payload["headers"] = {
-                "x-unblock-expect": json.dumps({
-                    "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan, body"
-                }),
-            }
+            # For page requests: wait for RENTCafe elements before returning.
+            # This ensures JS has rendered the floorplan selectors.
+            api_headers["x-unblock-expect"] = json.dumps({
+                "element": "[data-selenium-id], .floor-plan-selector, #FFloorPlan, body",
+            })
         else:
-            # AJAX calls: pass custom headers for X-Requested-With
-            # Note: Custom headers require "Custom Headers & Cookies" enabled
-            # in the zone. If not enabled, the API auto-generates headers.
-            # We try it anyway — if it fails, the response is still usable.
-            ajax_headers: dict[str, str] = {
+            # For AJAX calls: tell the API to add X-Requested-With header
+            # to the outbound request to the target site.
+            # NOTE: This requires "Custom Headers & Cookies" enabled in the
+            # zone config. If not enabled, the API auto-generates headers.
+            # We set it via x-unblock-custom-headers (HTTP header, not payload).
+            custom_headers: dict[str, str] = {
                 "Accept": "text/html, */*; q=0.01",
                 "X-Requested-With": "XMLHttpRequest",
             }
             if referer:
-                ajax_headers["Referer"] = referer
-            payload["headers"] = ajax_headers
+                custom_headers["Referer"] = referer
+            api_headers["x-unblock-custom-headers"] = json.dumps(custom_headers)
 
         # Make API request
         import requests as _requests
@@ -331,10 +351,7 @@ class BrightDataFetcher:
         try:
             resp = _requests.post(
                 self.API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self._api_key}",
-                },
+                headers=api_headers,
                 json=payload,
                 timeout=api_timeout,
             )
@@ -384,14 +401,33 @@ class BrightDataFetcher:
                 f"BrightData API error HTTP {resp.status_code}: {msg}"
             )
 
-        # Extract HTML from response
-        # format=raw returns the page content directly
-        html = resp.text
+        # Parse JSON response (format=json returns structured data)
+        try:
+            data = resp.json()
+        except Exception as e:
+            # If JSON parsing fails, fall back to raw text
+            logger.warning(
+                "BrightData response not JSON (url=%s, %.1fs, %d chars). "
+                "Falling back to raw text. Error: %s",
+                url, elapsed, len(resp.text), e,
+            )
+            html = resp.text
+            target_status = resp.status_code
+        else:
+            # format=json returns: {status_code, headers, body}
+            target_status = data.get("status_code", 0)
+            html = data.get("body", "")
+
+        # Check the x-brd-debug header for debugging info
+        debug_header = resp.headers.get("x-brd-debug", "")
+        if debug_header:
+            logger.debug("BrightData debug: %s", debug_header)
 
         # Log response details for debugging
         logger.info(
-            "BrightData fetch: url=%s, status=%d, %.1fs, %d chars, credits=%d/%d",
-            url, resp.status_code, elapsed, len(html), get_credit_usage(), get_credit_limit(),
+            "BrightData fetch: url=%s, api_status=%d, target_status=%s, %.1fs, %d chars, credits=%d/%d",
+            url, resp.status_code, target_status or "?", elapsed, len(html),
+            get_credit_usage(), get_credit_limit(),
         )
 
         # Check if returned HTML is still a CF challenge (shouldn't happen
