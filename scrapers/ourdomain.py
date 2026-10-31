@@ -259,8 +259,13 @@ class OurDomainScraper(AbstractScraper):
                 if zr.is_configured:
                     self._zenrows_fetcher = zr
                     logger.info("Using ZenRows Fetch API for CF bypass")
+                else:
+                    logger.warning(
+                        "ZENROWS_API_KEY not set — ZenRows fallback unavailable. "
+                        "Sign up (free, no KYC): https://app.zenrows.com/register"
+                    )
             except ImportError:
-                pass
+                logger.warning("zenrows_fetcher module not importable — skipping ZenRows fallback")
 
         if self._zenrows_fetcher is not None:
             if not self._zenrows_fetcher.is_initialized:
@@ -456,22 +461,30 @@ class OurDomainScraper(AbstractScraper):
         move_in_date: str,
     ) -> tuple[dict[str, dict], bool, dict[str, str]]:
         """
-        CF bypass 抓取：通过 BrightData API 或 CloakBrowser 获取 HTML。
+        CF bypass 抓取：通过 BrightData / ZenRows API 获取 HTML。
 
-        优先使用 BrightData Web Unlocker API（能处理 WAF firewall 级封锁），
-        未配置时回退到 CloakBrowser（仅能处理 JS challenge）。
+        Fetcher 优先级（_get_fetcher 内部处理）：
+        1. BrightData API（若 BRIGHTDATA_API_KEY 已设且未被 KYC 隔离）
+        2. ZenRows API（若 ZENROWS_API_KEY 已设）
+        3. CloakBrowser（兜底，仅 JS challenge）
 
-        如果 BrightData 返回 KYC 错误（某些域名需要住宅代理，免费版无 KYC
-        无法使用），自动切换到 ZenRows API（无需 KYC，不检查 robots.txt）。
-        如果 ZenRows 也失败，最后回退到 CloakBrowser（仅 JS challenge）。
+        KYC 自动切换
+        ------------
+        BrightData 免费版对 robots.txt Disallow: / 的域名返回 KYC 错误。
+        当任何一次 fetch_html 调用收到 KYC 错误时，立即：
+        - 标记 _brightdata_kyc_blocked = True（本 session 不再用 BrightData）
+        - 丢弃 _brightdata_fetcher
+        - _get_fetcher 下次调用自动返回 ZenRows（或 CloakBrowser）
+
+        这样无论是 floorplans.aspx 还是 AJAX rcLoadContent.ashx 调用，
+        KYC 错误都能触发切换，不会卡在 BrightData 上。
 
         Floorplan ID 缓存
         ------------------
         floorplan IDs 变化频率极低（楼盘户型结构不变），缓存 12 小时。
-        命中缓存时跳过 floorplans.aspx 请求，节省 1 API credit。
+        命中缓存时跳过 floorplans.aspx 请求，节省 API credits。
         """
         slug = floorplans_url.split("/")[-2] if "/" in floorplans_url else "default"
-        fetcher = self._get_fetcher(floorplans_url)
 
         all_units: dict[str, dict] = {}
         complete = True
@@ -482,39 +495,12 @@ class OurDomainScraper(AbstractScraper):
             fp_ids, fp_names_by_id = cached
             logger.debug("[%s] floorplan cache hit: %d IDs", display, len(fp_ids))
         else:
-            try:
-                fp_html = fetcher.fetch_html(floorplans_url)
-            except BlockedError as e:
-                # Check if this is a KYC/residential restriction error
-                # from BrightData. If so, try ZenRows first (no KYC needed),
-                # then CloakBrowser as last resort.
-                if "KYC" in str(e) or "residential" in str(e).lower():
-                    logger.warning(
-                        "[%s] BrightData KYC 限制，切换到 ZenRows: %s",
-                        display, e,
-                    )
-                    # Blacklist BrightData for this session and drop the fetcher
-                    self._brightdata_kyc_blocked = True
-                    self._brightdata_fetcher = None
-                    # Try ZenRows (will be picked up by _get_fetcher)
-                    fetcher = self._get_fetcher(floorplans_url)
-                    try:
-                        fp_html = fetcher.fetch_html(floorplans_url)
-                    except BlockedError as e2:
-                        # ZenRows also failed — try CloakBrowser as last resort
-                        logger.warning(
-                            "[%s] ZenRows 也失败，切换到 CloakBrowser: %s",
-                            display, e2,
-                        )
-                        self._zenrows_fetcher = None
-                        fetcher = self._ensure_browser(floorplans_url)
-                        fp_html = fetcher.fetch_html(floorplans_url)
-                else:
-                    raise
+            fp_html = self._fetch_with_kyc_fallback(
+                floorplans_url, display=display, ajax=False,
+            )
             fp_ids = _extract_floorplan_ids(fp_html)
             if not fp_ids:
                 # Diagnostic logging: show what patterns ARE in the HTML
-                # to help identify why the regex didn't match.
                 has_subpointer = "subPointerId" in fp_html
                 has_myfloorplan = "myFloorPlanId" in fp_html
                 has_fp_detail = "FP_Detail_" in fp_html
@@ -523,7 +509,6 @@ class OurDomainScraper(AbstractScraper):
                 has_floorplan_selector = "floor-plan-selector" in fp_html
                 has_ffloorplan = "FFloorPlan" in fp_html
                 has_data_selenium = "data-selenium-id" in fp_html
-                # Check for JS-rendered floorplan data in script tags
                 has_fp_js = "floorPlan" in fp_html or "floorplan" in fp_html.lower()
                 logger.warning(
                     "[%s] 未发现 floorplan id (html=%d chars). "
@@ -560,8 +545,12 @@ class OurDomainScraper(AbstractScraper):
                 f"&myolePropertyID={property_id}"
             )
             try:
-                unit_html = fetcher.fetch_html(url, referer=floorplans_url, ajax=True)
-            except (RateLimitError, BlockedError):
+                unit_html = self._fetch_with_kyc_fallback(
+                    url, display=display, ajax=True, referer=floorplans_url,
+                )
+            except RateLimitError:
+                raise
+            except BlockedError:
                 raise
             except Exception as e:
                 complete = False
@@ -578,8 +567,6 @@ class OurDomainScraper(AbstractScraper):
                     display, fp_id, len(units_found), len(unit_html),
                 )
             else:
-                # Log when no units found for debugging — could be genuinely
-                # no availability, or could be HTML structure change.
                 has_unitrow = "unitrow" in unit_html
                 has_no_units = "no units" in unit_html.lower() or "no available" in unit_html.lower()
                 logger.debug(
@@ -591,6 +578,59 @@ class OurDomainScraper(AbstractScraper):
             for unit in units_found:
                 _merge_unit(all_units, unit, fp_id)
         return all_units, complete, fp_names_by_id
+
+    def _fetch_with_kyc_fallback(
+        self,
+        url: str,
+        *,
+        display: str,
+        ajax: bool = False,
+        referer: str = "",
+    ) -> str:
+        """
+        Fetch HTML with automatic KYC fallback from BrightData → ZenRows.
+
+        When BrightData returns a KYC/residential restriction error, this
+        method automatically:
+        1. Blacklists BrightData for this session (_brightdata_kyc_blocked)
+        2. Drops the BrightData fetcher
+        3. Retries with ZenRows (or CloakBrowser as last resort)
+
+        This ensures KYC errors on ANY call (floorplans.aspx OR AJAX
+        rcLoadContent.ashx) trigger the fallback, not just the initial
+        page fetch.
+
+        Raises BlockedError if all fetchers fail.
+        """
+        fetcher = self._get_fetcher(url)
+        try:
+            return fetcher.fetch_html(url, referer=referer, ajax=ajax)
+        except BlockedError as e:
+            err_str = str(e)
+            is_kyc = "KYC" in err_str or "residential" in err_str.lower()
+            if not is_kyc:
+                # Non-KYC block — re-raise as-is
+                raise
+            logger.warning(
+                "[%s] BrightData KYC 限制，切换到 ZenRows: %s",
+                display, err_str[:200],
+            )
+            # Blacklist BrightData for this session
+            self._brightdata_kyc_blocked = True
+            self._brightdata_fetcher = None
+            # Get ZenRows (or CloakBrowser) fetcher
+            fetcher = self._get_fetcher(url)
+            try:
+                return fetcher.fetch_html(url, referer=referer, ajax=ajax)
+            except BlockedError as e2:
+                # ZenRows also failed — try CloakBrowser as last resort
+                logger.warning(
+                    "[%s] ZenRows 也失败，切换到 CloakBrowser: %s",
+                    display, str(e2)[:200],
+                )
+                self._zenrows_fetcher = None
+                browser_fetcher = self._ensure_browser(url)
+                return browser_fetcher.fetch_html(url, referer=referer, ajax=ajax)
 
     def _scrape_once(
         self,
