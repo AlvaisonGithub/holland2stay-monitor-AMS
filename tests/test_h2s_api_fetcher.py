@@ -153,7 +153,11 @@ def test_dom_fallback_end_to_end(monkeypatch):
     def fake_get(url, params=None, **kw):
         if "h2s-dom-result" in params.get("js_instructions", "") or "?city" in params["url"]:
             calls["dom"] += 1
-            assert "city%5B%5D=24" in params["url"]
+            assert "city%5Bfilter%5D=Amsterdam%2C24" in params["url"] or "city%5Bfilter%5D=Diemen%2C110" in params["url"]
+            assert "page=1" in params["url"]
+            if "Diemen" in params["url"]:
+                return _resp(text=_dom_page([c for c in _CARDS if "Diemen" in c["text"]]))
+            return _resp(text=_dom_page([c for c in _CARDS if "Amsterdam" in c["text"]]))
             return _resp(text=_dom_page(_CARDS))
         # in-page GraphQL attempt: every endpoint fails
         return _resp(text='<html><pre id="h2s-gql-result" data-status="0">FETCH_ERROR /api/remote HTTP 400</pre></html>')
@@ -174,6 +178,8 @@ def test_dom_fallback_end_to_end(monkeypatch):
     assert l.url == "https://www.holland2stay.com/residences/kastanjelaan-1-108"
     assert res.complete is True
     assert calls["dom"] == 2
+    assert [l.id for l in res2.listings] == ["bar-3"]
+    assert res2.listings[0].status == "Available in lottery"
     assert mod.H2SApiFetcher._gql_dead_until > 0
     mod.H2SApiFetcher._gql_dead_until = 0.0
 
@@ -183,3 +189,19 @@ def test_dom_zero_links_is_blocked_not_empty(monkeypatch):
     with patch("requests.get", return_value=_resp(text=_dom_page([]))):
         with pytest.raises(BlockedError):
             mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}})
+
+
+def test_dom_city_filter_not_applied_raises(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    rotterdam = [{"href": "https://www.holland2stay.com/residences/x", "slug": "x", "title": "X",
+                  "text": "G.H. Betzweg 303, Rotterdam Direct boeken"}]
+    with patch("requests.get", return_value=_resp(text=_dom_page(rotterdam))):
+        with pytest.raises(BlockedError):
+            mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["110"]}}, "currentPage": 1})
+
+
+def test_dutch_status_labels():
+    t = "G.H. Betzweg 303, Rotterdam Direct boeken 56,8 m 2 *servicekosten bedragen \u20ac335,00 per maand."
+    assert mod._parse_status(t) == 179
+    assert mod._parse_price(t) is None
+    assert mod._parse_area(t) == "56.8"

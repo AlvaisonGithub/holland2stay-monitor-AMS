@@ -53,12 +53,25 @@ _INPAGE_ENDPOINTS = ["/api/remote", "/api/graphql"]
 
 # Status label → available_to_book ID (same IDs as scrapers/holland2stay._STATUS_MAP)
 _STATUS_LABELS: list[tuple[str, int]] = [
-    ("available to book", 179),
-    ("available in lottery", 336),
+    # most specific first (English + Dutch site labels)
     ("to be in lottery", 6204),
+    ("binnenkort in loting", 6204),
+    ("binnenkort loting", 6204),
+    ("available to book", 179),
+    ("direct boeken", 179),
+    ("direct te boeken", 179),
+    ("book directly", 179),
+    ("available in lottery", 336),
+    ("in loting", 336),
+    ("loting", 336),
+    ("lottery", 336),
     ("coming soon", 6253),
+    ("binnenkort", 6253),
     ("reserved", 6203),
+    ("gereserveerd", 6203),
     ("occupied", 180),
+    ("verhuurd", 180),
+    ("bezet", 180),
 ]
 
 # After a full GraphQL failure, skip GraphQL attempts for this long and go
@@ -91,6 +104,10 @@ _DOM_EXTRACT_JS = r"""
       title:((h&&h.innerText)||a.innerText||'').replace(/\s+/g,' ').trim().slice(0,160),
       text:(card.innerText||'').replace(/\s+/g,' ').trim().slice(0,600)});
   });
+  var maxp=1;
+  document.querySelectorAll('a[href*="page="]').forEach(function(a){
+    var m=a.href.match(/[?&]page=(\d+)/);if(m)maxp=Math.max(maxp,parseInt(m[1],10));});
+  out.max_page=maxp;
   var d=document.createElement('pre');d.id='h2s-dom-result';d.style.display='none';
   d.textContent=JSON.stringify(out);document.body.appendChild(d);
 })()
@@ -368,10 +385,14 @@ class H2SApiFetcher:
         filters = (variables or {}).get("filters") or {}
         city_ids = [str(c) for c in ((filters.get("city") or {}).get("in") or [])]
         avail_ids = {int(a) for a in ((filters.get("available_to_book") or {}).get("in") or []) if str(a).isdigit()}
+        page_no = int((variables or {}).get("currentPage") or 1)
 
-        qs = "&".join([f"city%5B%5D={quote(c)}" for c in city_ids]
-                      + [f"available_to_book%5B%5D={a}" for a in sorted(avail_ids)])
-        page_url = _H2S_REFERER + (f"?{qs}" if qs else "")
+        # New (Next.js) site format: ?page=1&city[filter]=Rotterdam,25
+        names = _city_names_by_id()
+        qs = [f"page={page_no}"]
+        for c in city_ids:
+            qs.append("city%5Bfilter%5D=" + quote(f"{names.get(c, c)},{c}"))
+        page_url = _H2S_REFERER + "?" + "&".join(qs)
 
         params = {
             "apikey": self._zr_key,
@@ -382,7 +403,7 @@ class H2SApiFetcher:
             "block_resources": "image,media,font",
             "js_instructions": json.dumps([
                 {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
-                {"wait": 5000},
+                {"wait": 7000},
                 {"scroll_y": 4000},
                 {"wait": 2000},
                 {"scroll_y": 8000},
@@ -414,23 +435,40 @@ class H2SApiFetcher:
             raise _exc("ScrapeNetworkError")(f"H2S residences page: bad extractor JSON: {e}")
 
         cards = data.get("cards") or []
+        body_txt = (data.get("body") or "").lower()
         if not cards:
+            if re.search(r"geen (woningen|resultaten)|no (results|residences)|0 (resultaten|results)", body_txt):
+                logger.info("H2S residences page: site reports no homes for city=%s", city_ids)
+                return {"data": {"products": {"total_count": 0,
+                        "page_info": {"current_page": page_no, "total_pages": page_no}, "items": []}}}
             # A real page with zero residence links means our reading is wrong,
             # not that there are no homes — don't report an empty "complete" scan.
             raise _exc("BlockedError")(
-                f"H2S residences page: no residence links found (title={data.get('title')!r}, "
+                f"H2S residences page: no residence links found (url={page_url}, title={data.get('title')!r}, "
                 f"text={data.get('body', '')[:250]!r})"
             )
 
+        # Make sure the city filter actually applied (otherwise we'd silently
+        # report "0 homes" for a city we never looked at).
+        wanted = [names[c].lower() for c in city_ids if c in names]
+        if wanted:
+            mentions_wanted = sum(1 for c in cards if any(w in (c.get("text") or "").lower() for w in wanted))
+            if mentions_wanted == 0:
+                raise _exc("BlockedError")(
+                    f"H2S residences page: city filter not applied for {wanted} (url={page_url}); "
+                    f"first card: {(cards[0].get('text') or '')[:150]!r}"
+                )
+
+        total_pages = max(page_no, int(data.get("max_page") or 1))
         items = _cards_to_items(cards, city_ids, avail_ids)
         type(self)._sticky_strategy = "zenrows-dom"
         logger.info(
-            "H2S residences page read via ZenRows (%.1fs): %d cards on page, %d match city=%s status=%s",
-            time.monotonic() - start, len(cards), len(items), city_ids, sorted(avail_ids),
+            "H2S residences page %d/%d read via ZenRows (%.1fs): %d cards, %d match city=%s status=%s",
+            page_no, total_pages, time.monotonic() - start, len(cards), len(items), city_ids, sorted(avail_ids),
         )
         return {"data": {"products": {
             "total_count": len(items),
-            "page_info": {"current_page": 1, "total_pages": 1},
+            "page_info": {"current_page": page_no, "total_pages": total_pages},
             "items": items,
         }}}
 
@@ -635,6 +673,8 @@ def _parse_status(text: str) -> Optional[int]:
 
 
 def _parse_price(text: str) -> Optional[float]:
+    # Drop the "*servicekosten ... €335,00 per maand" footnote: that's not the rent
+    text = re.split(r"\*?\s*(servicekosten|service costs)", text, flags=re.I)[0]
     m = re.search(r"\u20ac\s*([0-9][0-9.,]*)", text)
     if not m:
         return None
@@ -669,6 +709,11 @@ def _parse_date(text: str) -> Optional[str]:
     return None
 
 
+def _parse_area(text: str) -> Optional[str]:
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m\s*(?:2|²)", text)
+    return m.group(1).replace(",", ".") if m else None
+
+
 def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int]) -> list[dict]:
     """Turn residence cards read from the page into GraphQL-like product items."""
     names = _city_names_by_id()
@@ -701,6 +746,9 @@ def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int])
         }
         if price is not None:
             item["basic_rent"] = price
+        area = _parse_area(text)
+        if area:
+            item["living_area"] = area
         if city_ids:
             item["city"] = city_ids[0]
         items.append(item)
