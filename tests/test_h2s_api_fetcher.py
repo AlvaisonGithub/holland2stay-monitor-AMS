@@ -29,6 +29,7 @@ def _resp(status=200, text="", headers=None, json_obj=None):
 def _reset(monkeypatch):
     mod.H2SApiFetcher._sticky_strategy = None
     mod.H2SApiFetcher._disabled_providers = set()
+    mod.H2SApiFetcher._gql_dead_until = 0.0
     for k in ("ZENROWS_API_KEY", "BRIGHTDATA_API_KEY", "H2S_FETCH_MODE"):
         monkeypatch.delenv(k, raising=False)
     yield
@@ -52,15 +53,6 @@ def test_zenrows_post_success_and_sticky(monkeypatch):
         assert post.call_args.kwargs["params"]["url"] == mod.H2S_GQL_URL
     assert mod.H2SApiFetcher._sticky_strategy == "zenrows-post"
 
-
-def test_falls_back_to_zenrows_get_with_pre_wrapped_json(monkeypatch):
-    monkeypatch.setenv("ZENROWS_API_KEY", "k")
-    wrapped = "<html><body><pre>" + json.dumps(GQL_OK).replace('"', "&quot;") + "</pre></body></html>"
-    with patch("requests.post", return_value=_resp(text=CF_PAGE)), \
-         patch("requests.get", return_value=_resp(text=wrapped)) as get:
-        assert mod.H2SApiFetcher().fetch_gql("q", {"a": 1}) == GQL_OK
-        assert "query=q" in get.call_args.kwargs["params"]["url"]
-    assert mod.H2SApiFetcher._sticky_strategy == "zenrows-get"
 
 
 def test_zenrows_402_disables_provider_then_brightdata(monkeypatch):
@@ -134,3 +126,60 @@ def test_zenrows_render_in_page_fetch(monkeypatch):
          patch("requests.get", side_effect=fake_get):
         assert mod.H2SApiFetcher().fetch_gql("q", {"x": 1}) == GQL_OK
     assert mod.H2SApiFetcher._sticky_strategy == "zenrows-render"
+
+
+def _dom_page(cards):
+    import html as _h
+    payload = json.dumps({"cards": cards, "links": len(cards), "title": "Residences", "body": "x"})
+    return '<html><body><pre id="h2s-dom-result" style="display:none">' + _h.escape(payload) + "</pre></body></html>"
+
+
+_CARDS = [
+    {"href": "https://www.holland2stay.com/residences/kastanjelaan-1-108", "slug": "kastanjelaan-1-108",
+     "title": "Kastanjelaan 1-108", "text": "Kastanjelaan 1-108\nAmsterdam\n€ 1.395 p/m\nAvailable to book\nAvailable from 01-12-2026"},
+    {"href": "https://www.holland2stay.com/residences/foo-2", "slug": "foo-2",
+     "title": "Foo 2", "text": "Foo 2\nAmsterdam\n€ 950\nOccupied"},
+    {"href": "https://www.holland2stay.com/residences/bar-3", "slug": "bar-3",
+     "title": "Bar 3", "text": "Bar 3\nDiemen\n€ 1.100\nAvailable in lottery"},
+]
+
+
+def test_dom_fallback_end_to_end(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    import scrapers.holland2stay as h2s
+    mod.H2SApiFetcher._gql_dead_until = 0.0
+    calls = {"dom": 0}
+
+    def fake_get(url, params=None, **kw):
+        if "h2s-dom-result" in params.get("js_instructions", "") or "?city" in params["url"]:
+            calls["dom"] += 1
+            assert "city%5B%5D=24" in params["url"]
+            return _resp(text=_dom_page(_CARDS))
+        # in-page GraphQL attempt: every endpoint fails
+        return _resp(text='<html><pre id="h2s-gql-result" data-status="0">FETCH_ERROR /api/remote HTTP 400</pre></html>')
+
+    h2s._attr_label_cache = {}
+    with patch("requests.post", return_value=_resp(422, '{"code":"RESP001"}')), \
+         patch("requests.get", side_effect=fake_get):
+        s = h2s.HollandStayScraper()
+        with s.batch_session():
+            res = s.scrape(ScrapeTask(source="holland2stay", city_key="24", city_display="Amsterdam",
+                                      extra={"availability_ids": ["179", "336"]}))
+            # second city goes straight to the page (GraphQL marked dead)
+            res2 = s.scrape(ScrapeTask(source="holland2stay", city_key="110", city_display="Diemen",
+                                       extra={"availability_ids": ["179", "336"]}))
+    assert [l.id for l in res.listings] == ["kastanjelaan-1-108"]
+    l = res.listings[0]
+    assert l.status == "Available to book" and l.price_raw == "€1395" and l.available_from == "2026-12-01"
+    assert l.url == "https://www.holland2stay.com/residences/kastanjelaan-1-108"
+    assert res.complete is True
+    assert calls["dom"] == 2
+    assert mod.H2SApiFetcher._gql_dead_until > 0
+    mod.H2SApiFetcher._gql_dead_until = 0.0
+
+
+def test_dom_zero_links_is_blocked_not_empty(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    with patch("requests.get", return_value=_resp(text=_dom_page([]))):
+        with pytest.raises(BlockedError):
+            mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}})

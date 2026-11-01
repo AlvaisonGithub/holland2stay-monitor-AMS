@@ -213,7 +213,7 @@ def _to_listing(
     try:
         url_key = item.get("url_key", "")
         listing_id = url_key or item.get("sku", "")
-        url = f"https://www.holland2stay.com/residences/{url_key}.html" if url_key else ""
+        url = item.get("_url") or (f"https://www.holland2stay.com/residences/{url_key}.html" if url_key else "")
 
         sku = item.get("sku", "")
 

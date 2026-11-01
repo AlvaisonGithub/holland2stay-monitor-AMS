@@ -49,7 +49,52 @@ H2S_GQL_URL = "https://www.holland2stay.com/api/graphql"
 _H2S_REFERER = "https://www.holland2stay.com/residences"
 
 # Tried in this order from inside the rendered H2S page
-_INPAGE_ENDPOINTS = ["/api/graphql", "https://api.holland2stay.com/graphql"]
+_INPAGE_ENDPOINTS = ["/api/remote", "/api/graphql"]
+
+# Status label → available_to_book ID (same IDs as scrapers/holland2stay._STATUS_MAP)
+_STATUS_LABELS: list[tuple[str, int]] = [
+    ("available to book", 179),
+    ("available in lottery", 336),
+    ("to be in lottery", 6204),
+    ("coming soon", 6253),
+    ("reserved", 6203),
+    ("occupied", 180),
+]
+
+# After a full GraphQL failure, skip GraphQL attempts for this long and go
+# straight to reading the residences page (saves ~40s + credits per round).
+_GQL_RETRY_AFTER = 6 * 3600
+
+# Runs in the rendered /residences page: collects each residence card
+_DOM_EXTRACT_JS = r"""
+(function(){
+  var out={cards:[],links:0,title:document.title,
+           body:(document.body.innerText||'').replace(/\s+/g,' ').slice(0,400)};
+  var seen={};
+  document.querySelectorAll('a[href*="/residences/"]').forEach(function(a){
+    var href=a.href.split('#')[0].split('?')[0];
+    var m=href.match(/\/residences\/([^\/]+?)(?:\.html)?\/?$/);
+    if(!m||!m[1])return;
+    out.links++;
+    if(seen[href])return; seen[href]=1;
+    var el=a,card=a;
+    for(var i=0;i<8&&el;i++){
+      var hs={};el.querySelectorAll('a[href*="/residences/"]').forEach(function(x){
+        var k=x.href.split('#')[0].split('?')[0];if(/\/residences\/[^\/]+/.test(k))hs[k]=1;});
+      if(Object.keys(hs).length>1)break;
+      card=el;
+      if((el.innerText||'').indexOf('€')>=0)break;
+      el=el.parentElement;
+    }
+    var h=card.querySelector('h1,h2,h3,h4,h5,[class*="title" i],[class*="name" i]');
+    out.cards.push({href:href,slug:m[1],
+      title:((h&&h.innerText)||a.innerText||'').replace(/\s+/g,' ').trim().slice(0,160),
+      text:(card.innerText||'').replace(/\s+/g,' ').trim().slice(0,600)});
+  });
+  var d=document.createElement('pre');d.id='h2s-dom-result';d.style.display='none';
+  d.textContent=JSON.stringify(out);document.body.appendChild(d);
+})()
+"""
 
 _H2S_GQL_HEADERS = {
     "Accept": "application/json",
@@ -150,6 +195,7 @@ class H2SApiFetcher:
     _sticky_strategy: Optional[str] = None
     _disabled_providers: set[str] = set()
     _inpage_endpoint: Optional[str] = None
+    _gql_dead_until: float = 0.0
 
     def __init__(self, headless: bool = True, providers: Optional[list[str]] = None):
         # headless kept for interface compatibility
@@ -221,7 +267,16 @@ class H2SApiFetcher:
         extra_headers: dict[str, str] | None = None,
     ) -> dict:
         variables = variables or {}
+        is_aggs = "aggregations" in query
         body = json.dumps({"query": query, "variables": variables}, separators=(",", ":"))
+
+        # GraphQL known unreachable → read the residences page instead
+        if self._zr_key and "zenrows" not in self._disabled_providers \
+                and time.monotonic() < type(self)._gql_dead_until:
+            if is_aggs:
+                return {"data": {"products": {"aggregations": []}}}
+            return self._dom_products(variables)
+
         strategies = self._strategies()
         if not strategies:
             raise _exc("BlockedError")(
@@ -270,6 +325,15 @@ class H2SApiFetcher:
 
         type(self)._sticky_strategy = None
         summary = " | ".join(errors)[:800]
+
+        # Fallback: read listings straight from the rendered residences page
+        if self._zr_key and "zenrows" not in self._disabled_providers:
+            logger.warning("H2S GraphQL unreachable (%s) — falling back to reading the residences page", summary[:300])
+            type(self)._gql_dead_until = time.monotonic() + _GQL_RETRY_AFTER
+            if is_aggs:
+                return {"data": {"products": {"aggregations": []}}}
+            return self._dom_products(variables)
+
         if saw_rate_limit and all("429" in e or "rate" in e.lower() for e in errors):
             raise _exc("RateLimitError")(f"H2S API providers rate limited: {summary}")
         raise _exc("BlockedError")(f"H2S GraphQL: all API strategies failed: {summary}")
@@ -291,6 +355,84 @@ class H2SApiFetcher:
             except Exception:
                 pass
         return resp.text
+
+    def _dom_products(self, variables: dict) -> dict:
+        """
+        Render https://www.holland2stay.com/residences for one city in ZenRows'
+        browser, read the residence cards, and return them in the GraphQL
+        ``products`` shape that scrapers/holland2stay.py already parses.
+        """
+        import requests
+        from urllib.parse import quote
+
+        filters = (variables or {}).get("filters") or {}
+        city_ids = [str(c) for c in ((filters.get("city") or {}).get("in") or [])]
+        avail_ids = {int(a) for a in ((filters.get("available_to_book") or {}).get("in") or []) if str(a).isdigit()}
+
+        qs = "&".join([f"city%5B%5D={quote(c)}" for c in city_ids]
+                      + [f"available_to_book%5B%5D={a}" for a in sorted(avail_ids)])
+        page_url = _H2S_REFERER + (f"?{qs}" if qs else "")
+
+        params = {
+            "apikey": self._zr_key,
+            "url": page_url,
+            "js_render": "true",
+            "premium_proxy": "true",
+            "proxy_country": self._zr_country,
+            "block_resources": "image,media,font",
+            "js_instructions": json.dumps([
+                {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
+                {"wait": 5000},
+                {"scroll_y": 4000},
+                {"wait": 2000},
+                {"scroll_y": 8000},
+                {"wait": 2000},
+                {"evaluate": _DOM_EXTRACT_JS},
+            ]),
+        }
+        start = time.monotonic()
+        try:
+            resp = requests.get(self.ZENROWS_URL, params=params, timeout=150)
+        except requests.RequestException as e:
+            raise _exc("ScrapeNetworkError")(f"H2S residences page (ZenRows) network error: {e}")
+        try:
+            page = self._zenrows_check(resp)
+        except _ProviderDisabled as e:
+            type(self)._disabled_providers.add("zenrows")
+            raise _exc("BlockedError")(f"H2S residences page: {e}")
+        except _StrategyFailed as e:
+            raise _exc("BlockedError")(f"H2S residences page: {e}")
+
+        m = re.search(r'<pre[^>]*id="h2s-dom-result"[^>]*>(.*?)</pre>', page, re.S)
+        if not m:
+            if _looks_like_cf_challenge(page):
+                raise _exc("BlockedError")("H2S residences page: Cloudflare challenge not passed")
+            raise _exc("BlockedError")(f"H2S residences page: extractor output missing ({len(page)} chars)")
+        try:
+            data = json.loads(_html.unescape(m.group(1)))
+        except ValueError as e:
+            raise _exc("ScrapeNetworkError")(f"H2S residences page: bad extractor JSON: {e}")
+
+        cards = data.get("cards") or []
+        if not cards:
+            # A real page with zero residence links means our reading is wrong,
+            # not that there are no homes — don't report an empty "complete" scan.
+            raise _exc("BlockedError")(
+                f"H2S residences page: no residence links found (title={data.get('title')!r}, "
+                f"text={data.get('body', '')[:250]!r})"
+            )
+
+        items = _cards_to_items(cards, city_ids, avail_ids)
+        type(self)._sticky_strategy = "zenrows-dom"
+        logger.info(
+            "H2S residences page read via ZenRows (%.1fs): %d cards on page, %d match city=%s status=%s",
+            time.monotonic() - start, len(cards), len(items), city_ids, sorted(avail_ids),
+        )
+        return {"data": {"products": {
+            "total_count": len(items),
+            "page_info": {"current_page": 1, "total_pages": 1},
+            "items": items,
+        }}}
 
     def _zenrows_post(self, body: str, _gql: dict) -> str:
         """POST forwarded as-is through a NL residential proxy (no JS render)."""
@@ -474,6 +616,99 @@ class H2SApiFetcher:
             "country": self._bd_country,
         }
         return self._brightdata_call(payload)
+
+
+def _city_names_by_id() -> dict[str, str]:
+    try:
+        from config import KNOWN_CITIES
+        return {str(c["id"]): c["name"] for c in KNOWN_CITIES}
+    except Exception:  # noqa: BLE001
+        return {"24": "Amsterdam", "110": "Diemen"}
+
+
+def _parse_status(text: str) -> Optional[int]:
+    low = text.lower()
+    for label, sid in _STATUS_LABELS:
+        if label in low:
+            return sid
+    return None
+
+
+def _parse_price(text: str) -> Optional[float]:
+    m = re.search(r"\u20ac\s*([0-9][0-9.,]*)", text)
+    if not m:
+        return None
+    raw = m.group(1).rstrip(".,")
+    # "1.395" / "1,395" / "1.395,00" / "1395.50"
+    if re.fullmatch(r"\d{1,3}([.,]\d{3})+([.,]\d{1,2})?", raw):
+        raw = re.sub(r"[.,](\d{1,2})$", r"", raw)
+        raw = re.sub(r"[.,]", "", raw)
+    else:
+        raw = raw.replace(",", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august",
+     "september", "october", "november", "december"], 1)}
+
+
+def _parse_date(text: str) -> Optional[str]:
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b", text)
+    if m:
+        return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", text)
+    if m and m.group(2).lower() in _MONTHS:
+        return f"{m.group(3)}-{_MONTHS[m.group(2).lower()]:02d}-{int(m.group(1)):02d}"
+    return None
+
+
+def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int]) -> list[dict]:
+    """Turn residence cards read from the page into GraphQL-like product items."""
+    names = _city_names_by_id()
+    wanted = [names[c].lower() for c in city_ids if c in names]
+    all_city_names = [n.lower() for n in names.values()]
+    any_mentions_city = any(
+        any(n in (c.get("text") or "").lower() for n in all_city_names)
+        for c in cards
+    )
+
+    status_counts: dict[str, int] = {}
+    items: list[dict] = []
+    for c in cards:
+        text = c.get("text") or ""
+        low = text.lower()
+        if wanted and any_mentions_city and not any(w in low for w in wanted):
+            continue
+        sid = _parse_status(text)
+        status_counts[str(sid)] = status_counts.get(str(sid), 0) + 1
+        if avail_ids and sid not in avail_ids:
+            continue
+        price = _parse_price(text)
+        item = {
+            "url_key": c.get("slug") or "",
+            "sku": "",
+            "name": c.get("title") or c.get("slug") or "",
+            "available_to_book": sid,
+            "available_startdate": _parse_date(text),
+            "_url": c.get("href") or "",
+        }
+        if price is not None:
+            item["basic_rent"] = price
+        if city_ids:
+            item["city"] = city_ids[0]
+        items.append(item)
+    logger.info("H2S residences page statuses seen (status_id→count): %s; city filter by text=%s",
+                status_counts, bool(wanted and any_mentions_city))
+    if cards and not items:
+        logger.info("H2S residences page sample card: %s", (cards[0].get("text") or "")[:300])
+    return items
 
 
 def resolve_h2s_fetch_mode() -> str:
