@@ -170,6 +170,31 @@ def _fetch_attr_labels(fetcher: "BrowserFetcher") -> dict[str, dict[str, str]]:
 
 # ── BrowserFetcher（从共享模块导入）─────────────────────────────────
 from browser_fetcher import BrowserFetcher  # noqa: E402
+from .h2s_api_fetcher import make_api_fetcher, resolve_h2s_fetch_mode  # noqa: E402
+
+# API 模式下 attribute 标签跨轮缓存（省 ZenRows/BrightData 额度）
+_ATTR_LABEL_TTL = 12 * 3600
+_attr_label_cache: dict[str, dict[str, str]] = {}
+_attr_label_cache_at: float = 0.0
+
+
+def _get_attr_labels_cached(fetcher) -> dict[str, dict[str, str]]:
+    """aggregations 结果 12h 内复用；查询失败时降级为原始 ID 而不是整轮失败。"""
+    global _attr_label_cache, _attr_label_cache_at
+    now = time.monotonic()
+    if _attr_label_cache and now - _attr_label_cache_at < _ATTR_LABEL_TTL:
+        return _attr_label_cache
+    try:
+        labels = _fetch_attr_labels(fetcher)
+    except (RateLimitError, BlockedError, UpstreamMaintenanceError):
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("H2S aggregations 查询失败，标签降级为原始 ID: %s", e)
+        return _attr_label_cache
+    if labels:
+        _attr_label_cache = labels
+        _attr_label_cache_at = now
+    return labels or _attr_label_cache
 
 
 # ── Listing 转换 ────────────────────────────────────────────────────────
@@ -469,6 +494,19 @@ class HollandStayScraper(AbstractScraper):
             else:
                 return self._fetcher
 
+        # ZenRows / BrightData API 模式（CF 挑战由服务商处理，无需本地浏览器）
+        if resolve_h2s_fetch_mode() == "api":
+            self._fetcher = make_api_fetcher()
+            try:
+                self._fetcher.ensure_initialized()
+                self._attr_labels = _get_attr_labels_cached(self._fetcher)
+                self._browser_created_at = time.monotonic()
+                logger.info("H2S 使用 API 抓取模式 (ZenRows/BrightData)")
+                return self._fetcher
+            except Exception:
+                self._close_browser()
+                raise
+
         # 新建浏览器
         self._fetcher = BrowserFetcher(headless=CLOAKBROWSER_HEADLESS)
         try:
@@ -526,7 +564,11 @@ class HollandStayScraper(AbstractScraper):
             # 独立调用（单测 / 调试 / 非 dispatcher 路径）
             from config import CLOAKBROWSER_HEADLESS
 
-            with BrowserFetcher(headless=CLOAKBROWSER_HEADLESS) as fetcher:
+            _standalone = (
+                make_api_fetcher() if resolve_h2s_fetch_mode() == "api"
+                else BrowserFetcher(headless=CLOAKBROWSER_HEADLESS)
+            )
+            with _standalone as fetcher:
                 fetcher.ensure_initialized()
                 labels = _fetch_attr_labels(fetcher)
                 listings, complete = _scrape_city_pages(

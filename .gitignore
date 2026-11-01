@@ -94,3 +94,4 @@ google-services.json.enc
 # Android Profiler 输出
 *.hprof
 *.trace
+_to_delete/
