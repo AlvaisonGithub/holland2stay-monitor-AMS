@@ -323,7 +323,14 @@ class H2SApiFetcher:
         js = (
             "(function(){var d=document.createElement('pre');d.id='h2s-gql-pending';"
             "d.style.display='none';document.body.appendChild(d);"
-            "var eps=" + endpoints_js + ",log=[];"
+            # discover the API calls the H2S page itself made (Next.js rebuild moved the API)
+            "var seen={},disc=[],apis=[];"
+            "try{performance.getEntriesByType('resource').forEach(function(e){var u=e.name;"
+            "if(seen[u]||/\\/_next\\/static|\\.(js|css|png|jpe?g|svg|webp|woff2?|ico)(\\?|$)|google|facebook|hotjar|clarity|cookie/i.test(u))return;seen[u]=1;"
+            "if(/graphql/i.test(u))disc.push(u.split('?')[0]);"
+            "if(/\\/api\\/|graphql|magento|rest\\//i.test(u))apis.push(e.initiatorType+':'+u.slice(0,160));});}catch(e){}"
+            "d.setAttribute('data-discovered',apis.slice(0,25).join(' | '));"
+            "var eps=disc.concat(" + endpoints_js + ").filter(function(v,i,a){return a.indexOf(v)==i;}),log=[];"
             "function done(st,t,ep){d.setAttribute('data-status',st);d.setAttribute('data-endpoint',ep);"
             "d.textContent=t;d.id='h2s-gql-result';}"
             "function tryAt(i){if(i>=eps.length){done(0,'FETCH_ERROR '+log.join(' ; '),'');return;}"
@@ -347,6 +354,7 @@ class H2SApiFetcher:
             "js_instructions": json.dumps([
                 # real H2S (Next.js) page loaded = CF challenge passed
                 {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
+                {"wait": 4000},  # let the page make its own API calls
                 {"evaluate": js},
                 {"wait_for": "#h2s-gql-result"},
             ]),
@@ -362,8 +370,11 @@ class H2SApiFetcher:
             raise _StrategyFailed(f"render: {reason} ({len(page)} chars)")
         inner = _html.unescape(m.group(1)).strip()
         st = re.search(r'data-status="(\d+)"', m.group(0))
+        disc = re.search(r'data-discovered="([^"]*)"', m.group(0))
+        disc_txt = _html.unescape(disc.group(1)) if disc else ""
+        logger.info("H2S page API calls seen: %s", disc_txt or "(none)")
         if inner.startswith("FETCH_ERROR"):
-            raise _StrategyFailed(f"in-page fetch failed: {inner[:400]}")
+            raise _StrategyFailed(f"in-page fetch failed: {inner[:400]} || page API calls: {disc_txt[:800] or 'none'}")
         ep = re.search(r'data-endpoint="([^"]*)"', m.group(0))
         if ep and type(self)._inpage_endpoint != ep.group(1):
             type(self)._inpage_endpoint = ep.group(1)
