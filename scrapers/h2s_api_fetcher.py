@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 H2S_GQL_URL = "https://www.holland2stay.com/api/graphql"
 _H2S_REFERER = "https://www.holland2stay.com/residences"
 
+# Tried in this order from inside the rendered H2S page
+_INPAGE_ENDPOINTS = ["/api/graphql", "https://api.holland2stay.com/graphql"]
+
 _H2S_GQL_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
@@ -146,6 +149,7 @@ class H2SApiFetcher:
     # Shared across instances: which strategy worked last, disabled providers
     _sticky_strategy: Optional[str] = None
     _disabled_providers: set[str] = set()
+    _inpage_endpoint: Optional[str] = None
 
     def __init__(self, headless: bool = True, providers: Optional[list[str]] = None):
         # headless kept for interface compatibility
@@ -197,12 +201,11 @@ class H2SApiFetcher:
             if p in self._disabled_providers:
                 continue
             if p == "zenrows" and self._zr_key:
-                out.append(("zenrows-post", self._zenrows_post))
+                # GET is not supported by H2S (/api/graphql GET → 404), so only POST paths
                 out.append(("zenrows-render", self._zenrows_render))
-                out.append(("zenrows-get", self._zenrows_get))
+                out.append(("zenrows-post", self._zenrows_post))
             elif p == "brightdata" and self._bd_key:
                 out.append(("brightdata-post", self._brightdata_post))
-                out.append(("brightdata-get", self._brightdata_get))
         sticky = self._sticky_strategy
         if sticky and any(n == sticky for n, _ in out):
             out.sort(key=lambda s: 0 if s[0] == sticky else 1)
@@ -316,14 +319,23 @@ class H2SApiFetcher:
         import requests
         headers_js = json.dumps({k: v for k, v in _H2S_GQL_HEADERS.items()
                                  if k in ("Accept", "Content-Type", "Store", "Content-Currency")})
+        endpoints_js = json.dumps(_INPAGE_ENDPOINTS)
         js = (
             "(function(){var d=document.createElement('pre');d.id='h2s-gql-pending';"
             "d.style.display='none';document.body.appendChild(d);"
-            "fetch('/api/graphql',{method:'POST',credentials:'include',headers:" + headers_js
+            "var eps=" + endpoints_js + ",log=[];"
+            "function done(st,t,ep){d.setAttribute('data-status',st);d.setAttribute('data-endpoint',ep);"
+            "d.textContent=t;d.id='h2s-gql-result';}"
+            "function tryAt(i){if(i>=eps.length){done(0,'FETCH_ERROR '+log.join(' ; '),'');return;}"
+            "var ep=eps[i];"
+            "fetch(ep,{method:'POST',credentials:(ep.charAt(0)=='/'?'include':'omit'),headers:" + headers_js
             + ",body:" + json.dumps(body) + "})"
-            ".then(function(r){return r.text().then(function(t){d.setAttribute('data-status',r.status);"
-            "d.textContent=t;d.id='h2s-gql-result';});})"
-            ".catch(function(e){d.textContent='FETCH_ERROR '+e;d.id='h2s-gql-result';});})()"
+            ".then(function(r){return r.text().then(function(t){"
+            "var s=t.replace(/^\\s+/,'');"
+            "if(s.charAt(0)=='{'&&(s.indexOf('\"data\"')>=0||s.indexOf('\"errors\"')>=0)){done(r.status,t,ep);}"
+            "else{log.push(ep+' HTTP '+r.status+' '+t.slice(0,120));tryAt(i+1);}});})"
+            ".catch(function(e){log.push(ep+' '+e);tryAt(i+1);});}"
+            "tryAt(0);})()"
         )
         params = {
             "apikey": self._zr_key,
@@ -333,7 +345,8 @@ class H2SApiFetcher:
             "proxy_country": self._zr_country,
             "block_resources": "image,media,font",
             "js_instructions": json.dumps([
-                {"wait_for": "body"},
+                # real H2S (Next.js) page loaded = CF challenge passed
+                {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
                 {"evaluate": js},
                 {"wait_for": "#h2s-gql-result"},
             ]),
@@ -350,7 +363,11 @@ class H2SApiFetcher:
         inner = _html.unescape(m.group(1)).strip()
         st = re.search(r'data-status="(\d+)"', m.group(0))
         if inner.startswith("FETCH_ERROR"):
-            raise _StrategyFailed(f"in-page fetch failed: {inner[:150]}")
+            raise _StrategyFailed(f"in-page fetch failed: {inner[:400]}")
+        ep = re.search(r'data-endpoint="([^"]*)"', m.group(0))
+        if ep and type(self)._inpage_endpoint != ep.group(1):
+            type(self)._inpage_endpoint = ep.group(1)
+            logger.info("H2S in-page GraphQL endpoint: %s", ep.group(1))
         if st and st.group(1) == "429":
             raise _exc("RateLimitError")("H2S 429 (in-page fetch via ZenRows)")
         if _extract_gql_json(inner) is None:

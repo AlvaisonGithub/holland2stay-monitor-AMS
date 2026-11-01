@@ -117,3 +117,20 @@ def test_scraper_uses_api_fetcher_when_key_set(monkeypatch):
     assert len(res.listings) == 1
     assert isinstance(res.listings[0], Listing)
     assert res.listings[0].status == "Available to book"
+
+
+def test_zenrows_render_in_page_fetch(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    import html as _h
+    page = ('<html><body><div>H2S</div><pre id="h2s-gql-result" style="display:none" data-status="200">'
+            + _h.escape(json.dumps(GQL_OK)) + "</pre></body></html>")
+
+    def fake_get(url, params=None, **kw):
+        assert params["js_render"] == "true"
+        assert "/api/graphql" in params["js_instructions"]
+        return _resp(text=page)
+
+    with patch("requests.post", return_value=_resp(422, '{"code":"RESP001"}')), \
+         patch("requests.get", side_effect=fake_get):
+        assert mod.H2SApiFetcher().fetch_gql("q", {"x": 1}) == GQL_OK
+    assert mod.H2SApiFetcher._sticky_strategy == "zenrows-render"
