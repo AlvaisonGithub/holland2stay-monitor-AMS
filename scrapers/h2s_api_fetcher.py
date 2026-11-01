@@ -198,6 +198,7 @@ class H2SApiFetcher:
                 continue
             if p == "zenrows" and self._zr_key:
                 out.append(("zenrows-post", self._zenrows_post))
+                out.append(("zenrows-render", self._zenrows_render))
                 out.append(("zenrows-get", self._zenrows_get))
             elif p == "brightdata" and self._bd_key:
                 out.append(("brightdata-post", self._brightdata_post))
@@ -304,6 +305,57 @@ class H2SApiFetcher:
         except requests.RequestException as e:
             raise _StrategyFailed(f"network: {e}")
         return self._zenrows_check(resp)
+
+    def _zenrows_render(self, body: str, _gql: dict) -> str:
+        """
+        Same idea as the old CloakBrowser path, but in ZenRows' browser:
+        load the H2S site (ZenRows solves the CF challenge), then run the
+        GraphQL POST from inside the page with fetch() and write the result
+        into a <pre id="h2s-gql-result"> element that we read back.
+        """
+        import requests
+        headers_js = json.dumps({k: v for k, v in _H2S_GQL_HEADERS.items()
+                                 if k in ("Accept", "Content-Type", "Store", "Content-Currency")})
+        js = (
+            "(function(){var d=document.createElement('pre');d.id='h2s-gql-pending';"
+            "d.style.display='none';document.body.appendChild(d);"
+            "fetch('/api/graphql',{method:'POST',credentials:'include',headers:" + headers_js
+            + ",body:" + json.dumps(body) + "})"
+            ".then(function(r){return r.text().then(function(t){d.setAttribute('data-status',r.status);"
+            "d.textContent=t;d.id='h2s-gql-result';});})"
+            ".catch(function(e){d.textContent='FETCH_ERROR '+e;d.id='h2s-gql-result';});})()"
+        )
+        params = {
+            "apikey": self._zr_key,
+            "url": _H2S_REFERER,
+            "js_render": "true",
+            "premium_proxy": "true",
+            "proxy_country": self._zr_country,
+            "block_resources": "image,media,font",
+            "js_instructions": json.dumps([
+                {"wait_for": "body"},
+                {"evaluate": js},
+                {"wait_for": "#h2s-gql-result"},
+            ]),
+        }
+        try:
+            resp = requests.get(self.ZENROWS_URL, params=params, timeout=120)
+        except requests.RequestException as e:
+            raise _StrategyFailed(f"network: {e}")
+        page = self._zenrows_check(resp)
+        m = re.search(r'<pre[^>]*id="h2s-gql-result"[^>]*>(.*?)</pre>', page, re.S)
+        if not m:
+            reason = "CF challenge page" if _looks_like_cf_challenge(page) else "result element missing"
+            raise _StrategyFailed(f"render: {reason} ({len(page)} chars)")
+        inner = _html.unescape(m.group(1)).strip()
+        st = re.search(r'data-status="(\d+)"', m.group(0))
+        if inner.startswith("FETCH_ERROR"):
+            raise _StrategyFailed(f"in-page fetch failed: {inner[:150]}")
+        if st and st.group(1) == "429":
+            raise _exc("RateLimitError")("H2S 429 (in-page fetch via ZenRows)")
+        if _extract_gql_json(inner) is None:
+            raise _StrategyFailed(f"in-page fetch HTTP {st.group(1) if st else '?'}: {inner[:150]!r}")
+        return inner
 
     def _zenrows_get(self, _body: str, gql: dict) -> str:
         """GraphQL-over-GET with mode=auto (JS render + premium proxy as needed)."""
