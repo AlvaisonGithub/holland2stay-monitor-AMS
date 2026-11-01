@@ -135,23 +135,22 @@ BASE_URL = "https://www.holland2stay.com/residences"
 CLOAKBROWSER_HEADLESS = os.environ.get("CLOAKBROWSER_HEADLESS", "true").lower() != "false"
 """True=无头模式（Docker/生产），False=可视化（本地调试）"""
 
-# ── BrightData Web Unlocker（用于 RENTCafe/SecureRC CF WAF 绕过）──────
+# ── ZenRows Fetch API（用于 OurDomain/RENTCafe CF WAF 绕过）──────────
 # Railway 等 cloud IP 被 CF WAF firewall rules 直接 403（IP 级封锁），
-# CloakBrowser 也无法绕过。BrightData Web Unlocker API 在住宅代理网络
-# 上执行 CF challenge solving + JS rendering + CAPTCHA solving，返回干净 HTML。
+# curl_cffi、CloakBrowser、BrightData（需 KYC）均无法使用。
+# ZenRows Fetch API 无需 KYC，不检查 robots.txt，auto JS rendering +
+# premium proxy，返回干净 HTML。
 #
-# 免费额度：5,000 请求/月，无需信用卡。
-# 注册：https://brightdata.com/products/web-unlocker
+# 免费额度：5,000 credits/month，无需信用卡，无需 KYC。
+# 注册：https://app.zenrows.com/register
 #
 # 环境变量：
-#   BRIGHTDATA_API_KEY     — API token（从 BrightData dashboard 获取）
-#   BRIGHTDATA_ZONE        — zone 名称（默认 web_unlocker1，agent 账户为 agent_unlocker）
-#   BRIGHTDATA_COUNTRY     — 国家代码（如 nl，用于地理定位）
-#   BRIGHTDATA_MONTHLY_CREDIT_LIMIT — 月度额度上限（默认 4500，留 500 buffer）
-BRIGHTDATA_API_KEY = os.environ.get("BRIGHTDATA_API_KEY", "").strip()
-BRIGHTDATA_ZONE = os.environ.get("BRIGHTDATA_ZONE", "web_unlocker1").strip()
-BRIGHTDATA_COUNTRY = os.environ.get("BRIGHTDATA_COUNTRY", "").strip()
-BRIGHTDATA_MONTHLY_CREDIT_LIMIT = int(os.environ.get("BRIGHTDATA_MONTHLY_CREDIT_LIMIT", "4500") or "4500")
+#   ZENROWS_API_KEY              — API key（从 ZenRows dashboard 获取）
+#   ZENROWS_COUNTRY              — 国家代码（如 nl，用于地理定位）
+#   ZENROWS_MONTHLY_CREDIT_LIMIT — 月度额度上限（默认 4500，留 500 buffer）
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "").strip()
+ZENROWS_COUNTRY = os.environ.get("ZENROWS_COUNTRY", "").strip()
+ZENROWS_MONTHLY_CREDIT_LIMIT = int(os.environ.get("ZENROWS_MONTHLY_CREDIT_LIMIT", "4500") or "4500")
 
 # curl_cffi TLS 指纹模拟池，绕过 Cloudflare WAF。
 # 配合代理使用时每个 IP 随机选取不同指纹，模拟真实多用户浏览器分布。
