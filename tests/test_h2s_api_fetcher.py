@@ -184,12 +184,38 @@ def test_dom_fallback_end_to_end(monkeypatch):
     mod.H2SApiFetcher._gql_dead_until = 0.0
 
 
-def test_dom_zero_links_is_blocked_not_empty(monkeypatch):
+def test_dom_zero_links_retries_then_not_ready(monkeypatch):
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
-    with patch("requests.get", return_value=_resp(text=_dom_page([]))):
-        with pytest.raises(BlockedError):
-            mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}})
+    waits = []
 
+    def fake_get(url, params=None, **kw):
+        waits.append(json.loads(params["js_instructions"])[1]["wait"])
+        return _resp(text=_dom_page([]))
+
+    with patch("requests.get", side_effect=fake_get):
+        with pytest.raises(mod.H2SPageNotReady):
+            mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}})
+    assert waits == [7000, 15000]
+
+
+def test_dom_retry_succeeds_second_time(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    pages = [_dom_page([]), _dom_page([c for c in _CARDS if "Amsterdam" in c["text"]])]
+    with patch("requests.get", side_effect=lambda *a, **k: _resp(text=pages.pop(0))):
+        out = mod.H2SApiFetcher()._dom_products(
+            {"filters": {"city": {"in": ["24"]}, "available_to_book": {"in": ["179", "336"]}}, "currentPage": 1})
+    assert [i["url_key"] for i in out["data"]["products"]["items"]] == ["kastanjelaan-1-108"]
+
+
+def test_scraper_page_not_ready_is_incomplete_not_blocked(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    import scrapers.holland2stay as h2s
+    s = h2s.HollandStayScraper()
+    s._fetcher = MagicMock()
+    with patch("scrapers.holland2stay._scrape_city_pages", side_effect=mod.H2SPageNotReady("slow")):
+        res = s.scrape(ScrapeTask(source="holland2stay", city_key="24", city_display="Amsterdam",
+                                  extra={"availability_ids": ["179"]}))
+    assert res.complete is False and res.listings == []
 
 def test_dom_city_filter_not_applied_raises(monkeypatch):
     monkeypatch.setenv("ZENROWS_API_KEY", "k")

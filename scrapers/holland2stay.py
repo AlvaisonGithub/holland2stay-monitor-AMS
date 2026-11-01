@@ -170,7 +170,7 @@ def _fetch_attr_labels(fetcher: "BrowserFetcher") -> dict[str, dict[str, str]]:
 
 # ── BrowserFetcher（从共享模块导入）─────────────────────────────────
 from browser_fetcher import BrowserFetcher  # noqa: E402
-from .h2s_api_fetcher import make_api_fetcher, resolve_h2s_fetch_mode  # noqa: E402
+from .h2s_api_fetcher import H2SPageNotReady, make_api_fetcher, resolve_h2s_fetch_mode  # noqa: E402
 
 # API 模式下 attribute 标签跨轮缓存（省 ZenRows/BrightData 额度）
 _ATTR_LABEL_TTL = 12 * 3600
@@ -553,13 +553,19 @@ class HollandStayScraper(AbstractScraper):
 
         if self._fetcher is not None:
             # 批次内：复用共享浏览器
-            listings, complete = _scrape_city_pages(
-                self._fetcher,
-                task.city_display,
-                city_ids=[task.city_key],
-                availability_ids=availability_ids,
-                attr_labels=self._attr_labels,
-            )
+            try:
+                listings, complete = _scrape_city_pages(
+                    self._fetcher,
+                    task.city_display,
+                    city_ids=[task.city_key],
+                    availability_ids=availability_ids,
+                    attr_labels=self._attr_labels,
+                )
+            except H2SPageNotReady as e:
+                # 页面加载慢、房源未渲染：临时问题。本轮标记不完整，不触发熔断，
+                # 不丢弃其它 source 的结果，下一轮自动重试。
+                logger.warning("[%s] H2S 本轮跳过（页面未渲染完成），下轮重试: %s", task.city_display, e)
+                return ScrapeResult(task=task, listings=[], complete=False)
         else:
             # 独立调用（单测 / 调试 / 非 dispatcher 路径）
             from config import CLOAKBROWSER_HEADLESS

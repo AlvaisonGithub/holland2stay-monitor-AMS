@@ -188,6 +188,13 @@ def _extract_gql_json(text: str) -> Optional[dict]:
     return None
 
 
+from .base import ScrapeNetworkError as _ScrapeNetworkError  # noqa: E402
+
+
+class H2SPageNotReady(_ScrapeNetworkError):
+    """Residences page loaded but listings never rendered (slow load). Temporary."""
+
+
 class _ProviderDisabled(Exception):
     """Provider can't be used this process (bad key, no credits, KYC)."""
 
@@ -393,58 +400,72 @@ class H2SApiFetcher:
             qs.append("city%5Bfilter%5D=" + quote(f"{names.get(c, c)},{c}"))
         page_url = _H2S_REFERER + "?" + "&".join(qs)
 
-        params = {
-            "apikey": self._zr_key,
-            "url": page_url,
-            "js_render": "true",
-            "premium_proxy": "true",
-            "proxy_country": self._zr_country,
-            "block_resources": "image,media,font",
-            "js_instructions": json.dumps([
-                {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
-                {"wait": 7000},
-                {"scroll_y": 4000},
-                {"wait": 2000},
-                {"scroll_y": 8000},
-                {"wait": 2000},
-                {"evaluate": _DOM_EXTRACT_JS},
-            ]),
-        }
         start = time.monotonic()
-        try:
-            resp = requests.get(self.ZENROWS_URL, params=params, timeout=150)
-        except requests.RequestException as e:
-            raise _exc("ScrapeNetworkError")(f"H2S residences page (ZenRows) network error: {e}")
-        try:
-            page = self._zenrows_check(resp)
-        except _ProviderDisabled as e:
-            type(self)._disabled_providers.add("zenrows")
-            raise _exc("BlockedError")(f"H2S residences page: {e}")
-        except _StrategyFailed as e:
-            raise _exc("BlockedError")(f"H2S residences page: {e}")
+        data: dict = {}
+        cards: list = []
+        # The listings render a few seconds after the page itself; on a slow
+        # load the first read only sees the cookie banner. Retry once with a
+        # longer wait before giving up.
+        waits = [7000, 15000]
+        for attempt, wait_ms in enumerate(waits, 1):
+            params = {
+                "apikey": self._zr_key,
+                "url": page_url,
+                "js_render": "true",
+                "premium_proxy": "true",
+                "proxy_country": self._zr_country,
+                "block_resources": "image,media,font",
+                "js_instructions": json.dumps([
+                    {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
+                    {"wait": wait_ms},
+                    {"scroll_y": 4000},
+                    {"wait": 2000},
+                    {"scroll_y": 8000},
+                    {"wait": 2000},
+                    {"evaluate": _DOM_EXTRACT_JS},
+                ]),
+            }
+            try:
+                resp = requests.get(self.ZENROWS_URL, params=params, timeout=150)
+            except requests.RequestException as e:
+                raise _exc("ScrapeNetworkError")(f"H2S residences page (ZenRows) network error: {e}")
+            try:
+                page = self._zenrows_check(resp)
+            except _ProviderDisabled as e:
+                type(self)._disabled_providers.add("zenrows")
+                raise _exc("BlockedError")(f"H2S residences page: {e}")
+            except _StrategyFailed as e:
+                raise _exc("BlockedError")(f"H2S residences page: {e}")
 
-        m = re.search(r'<pre[^>]*id="h2s-dom-result"[^>]*>(.*?)</pre>', page, re.S)
-        if not m:
-            if _looks_like_cf_challenge(page):
-                raise _exc("BlockedError")("H2S residences page: Cloudflare challenge not passed")
-            raise _exc("BlockedError")(f"H2S residences page: extractor output missing ({len(page)} chars)")
-        try:
-            data = json.loads(_html.unescape(m.group(1)))
-        except ValueError as e:
-            raise _exc("ScrapeNetworkError")(f"H2S residences page: bad extractor JSON: {e}")
+            m = re.search(r'<pre[^>]*id="h2s-dom-result"[^>]*>(.*?)</pre>', page, re.S)
+            if not m:
+                if _looks_like_cf_challenge(page):
+                    raise _exc("BlockedError")("H2S residences page: Cloudflare challenge not passed")
+                raise _exc("BlockedError")(f"H2S residences page: extractor output missing ({len(page)} chars)")
+            try:
+                data = json.loads(_html.unescape(m.group(1)))
+            except ValueError as e:
+                raise _exc("ScrapeNetworkError")(f"H2S residences page: bad extractor JSON: {e}")
 
-        cards = data.get("cards") or []
-        body_txt = (data.get("body") or "").lower()
-        if not cards:
+            cards = data.get("cards") or []
+            if cards:
+                break
+            body_txt = (data.get("body") or "").lower()
             if re.search(r"geen (woningen|resultaten)|no (results|residences)|0 (resultaten|results)", body_txt):
                 logger.info("H2S residences page: site reports no homes for city=%s", city_ids)
                 return {"data": {"products": {"total_count": 0,
                         "page_info": {"current_page": page_no, "total_pages": page_no}, "items": []}}}
-            # A real page with zero residence links means our reading is wrong,
-            # not that there are no homes — don't report an empty "complete" scan.
-            raise _exc("BlockedError")(
-                f"H2S residences page: no residence links found (url={page_url}, title={data.get('title')!r}, "
-                f"text={data.get('body', '')[:250]!r})"
+            if attempt < len(waits):
+                logger.info("H2S residences page: listings not rendered yet (attempt %d), retrying with longer wait", attempt)
+
+        if not cards:
+            # Page loaded (CF passed) but listings never rendered: a temporary
+            # hiccup, not a block. ScrapeNetworkError marks this round
+            # incomplete without tripping the 30-min H2S circuit breaker, and
+            # never reports a false "0 homes".
+            raise H2SPageNotReady(
+                f"H2S residences page: no residence links found after {len(waits)} tries "
+                f"(url={page_url}, title={data.get('title')!r}, text={data.get('body', '')[:250]!r})"
             )
 
         # Make sure the city filter actually applied (otherwise we'd silently
