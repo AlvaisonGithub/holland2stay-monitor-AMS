@@ -96,13 +96,12 @@ _DOM_EXTRACT_JS = r"""
         var k=x.href.split('#')[0].split('?')[0];if(/\/residences\/[^\/]+/.test(k))hs[k]=1;});
       if(Object.keys(hs).length>1)break;
       card=el;
-      if((el.innerText||'').indexOf('€')>=0)break;
       el=el.parentElement;
     }
     var h=card.querySelector('h1,h2,h3,h4,h5,[class*="title" i],[class*="name" i]');
     out.cards.push({href:href,slug:m[1],
       title:((h&&h.innerText)||a.innerText||'').replace(/\s+/g,' ').trim().slice(0,160),
-      text:(card.innerText||'').replace(/\s+/g,' ').trim().slice(0,600)});
+      text:(card.innerText||'').replace(/\s+/g,' ').trim().slice(0,1200)});
   });
   var maxp=1;
   document.querySelectorAll('a[href*="page="]').forEach(function(a){
@@ -460,7 +459,17 @@ class H2SApiFetcher:
                 )
 
         total_pages = max(page_no, int(data.get("max_page") or 1))
+
+        # If no card's status could be recognised, our reading of the page is
+        # off (e.g. new labels) — fail loudly instead of reporting "0 homes".
+        if not any(_parse_status(c.get("text") or "") is not None for c in cards):
+            raise _exc("BlockedError")(
+                f"H2S residences page: no status label recognised on {len(cards)} cards "
+                f"(url={page_url}); first card: {(cards[0].get('text') or '')[:200]!r}"
+            )
+
         items = _cards_to_items(cards, city_ids, avail_ids)
+        self._enrich_from_detail_pages(items)
         type(self)._sticky_strategy = "zenrows-dom"
         logger.info(
             "H2S residences page %d/%d read via ZenRows (%.1fs): %d cards, %d match city=%s status=%s",
@@ -471,6 +480,68 @@ class H2SApiFetcher:
             "page_info": {"current_page": page_no, "total_pages": total_pages},
             "items": items,
         }}}
+
+    def _enrich_from_detail_pages(self, items: list[dict]) -> None:
+        """Fill missing rent / start date from each residence's own page (cached 24h)."""
+        try:
+            max_fetch = int(os.environ.get("H2S_DETAIL_MAX_PER_ROUND", "5") or 5)
+        except ValueError:
+            max_fetch = 5
+        now = time.monotonic()
+        fetched = 0
+        for it in items:
+            if it.get("basic_rent") is not None and it.get("available_startdate"):
+                continue
+            url = it.get("_url")
+            if not url:
+                continue
+            cached = _DETAIL_CACHE.get(url)
+            if not cached or now - cached[0] > _DETAIL_TTL:
+                if fetched >= max_fetch:
+                    continue
+                fetched += 1
+                try:
+                    rent, date = self._fetch_detail(url)
+                except Exception as e:  # noqa: BLE001 — enrichment must never break the scan
+                    logger.warning("H2S detail page failed for %s: %s", url, e)
+                    continue
+                cached = (now, rent, date)
+                _DETAIL_CACHE[url] = cached
+            _, rent, date = cached
+            if it.get("basic_rent") is None and rent is not None:
+                it["basic_rent"] = rent
+            if not it.get("available_startdate") and date:
+                it["available_startdate"] = date
+
+    def _fetch_detail(self, url: str) -> tuple[Optional[float], Optional[str]]:
+        import requests
+        params = {
+            "apikey": self._zr_key,
+            "url": url,
+            "js_render": "true",
+            "premium_proxy": "true",
+            "proxy_country": self._zr_country,
+            "block_resources": "image,media,font",
+            "js_instructions": json.dumps([
+                {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
+                {"wait": 4000},
+                {"evaluate": _DETAIL_JS},
+            ]),
+        }
+        start = time.monotonic()
+        resp = requests.get(self.ZENROWS_URL, params=params, timeout=120)
+        page = self._zenrows_check(resp)
+        m = re.search(r'<pre[^>]*id="h2s-detail-result"[^>]*>(.*?)</pre>', page, re.S)
+        if not m:
+            raise _StrategyFailed("detail extractor output missing")
+        text = json.loads(_html.unescape(m.group(1))).get("text") or ""
+        rent, date = _parse_detail_rent(text), _parse_detail_date(text)
+        logger.info("H2S detail page %s (%.1fs): rent=%s available_from=%s", url, time.monotonic() - start, rent, date)
+        if rent is None:
+            i = text.lower().find("\u20ac")
+            logger.info("H2S detail page without recognised rent, text around first \u20ac: %r",
+                        text[max(0, i - 200):i + 200] if i >= 0 else text[:400])
+        return rent, date
 
     def _zenrows_post(self, body: str, _gql: dict) -> str:
         """POST forwarded as-is through a NL residential proxy (no JS render)."""
@@ -714,6 +785,65 @@ def _parse_area(text: str) -> Optional[str]:
     return m.group(1).replace(",", ".") if m else None
 
 
+def _parse_card_features(text: str) -> dict:
+    """Type / floor / energy / occupancy from Dutch or English card text (shown as-is)."""
+    out: dict = {}
+    m = re.search(r"\b(studio|\d+\s*(?:slaapkamers?|bedrooms?|kamers?|rooms?))\b", text, re.I)
+    if m:
+        out["no_of_rooms"] = m.group(1)
+    m = re.search(r"\b(\d+(?:e|de|ste|st|nd|rd|th)?\s*(?:verdieping|floor)|begane grond|ground floor)\b", text, re.I)
+    if m:
+        out["floor"] = m.group(1)
+    m = re.search(r"(?:energielabel|energy label)\s*([A-G]\+{0,4})", text, re.I)
+    if m:
+        out["energy_label"] = m.group(1).upper()
+    m = re.search(r"\b(single of koppel|single or couple|single|koppel|couple|\d+\s*(?:personen|persons|people))\b", text, re.I)
+    if m:
+        out["maximum_number_of_persons"] = m.group(1)
+    return out
+
+
+# Rent / date from a residence's own page, keyed by url → (time, rent, date)
+_DETAIL_CACHE: dict[str, tuple[float, Optional[float], Optional[str]]] = {}
+_DETAIL_TTL = 24 * 3600
+
+_DETAIL_JS = r"""
+(function(){
+  var d=document.createElement('pre');d.id='h2s-detail-result';d.style.display='none';
+  d.textContent=JSON.stringify({title:document.title,
+    text:(document.body.innerText||'').replace(/[ \t]+/g,' ').slice(0,12000)});
+  document.body.appendChild(d);
+})()
+"""
+
+_RENT_KEYS = [
+    r"kale huur|basishuur|basic rent|base rent",
+    r"huurprijs|huur per maand|rent per month|monthly rent",
+    r"totale huur|total rent|totaal per maand|total per month",
+    r"huur|rent|prijs|price",
+]
+
+
+def _parse_detail_rent(text: str) -> Optional[float]:
+    for keys in _RENT_KEYS:
+        for m in re.finditer(rf"(?:{keys})[^\u20ac]{{0,60}}\u20ac\s*([0-9][0-9.,]*)", text, re.I):
+            # skip service-cost lines
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            if re.search(r"service", text[line_start:m.end()], re.I):
+                continue
+            val = _parse_price("\u20ac" + m.group(1))
+            if val and val >= 200:
+                return val
+    return None
+
+
+def _parse_detail_date(text: str) -> Optional[str]:
+    m = re.search(r"(beschikbaar vanaf|beschikbaar per|available from|startdatum|ingangsdatum|start date)", text, re.I)
+    if m:
+        return _parse_date(text[m.end():m.end() + 60])
+    return None
+
+
 def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int]) -> list[dict]:
     """Turn residence cards read from the page into GraphQL-like product items."""
     names = _city_names_by_id()
@@ -749,6 +879,7 @@ def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int])
         area = _parse_area(text)
         if area:
             item["living_area"] = area
+        item.update(_parse_card_features(text))
         if city_ids:
             item["city"] = city_ids[0]
         items.append(item)
@@ -756,6 +887,11 @@ def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int])
                 status_counts, bool(wanted and any_mentions_city))
     if cards and not items:
         logger.info("H2S residences page sample card: %s", (cards[0].get("text") or "")[:300])
+    for it in items:
+        if it.get("basic_rent") is None:
+            logger.info("H2S card without rent (%s): %s", it.get("url_key"),
+                        next((c.get("text") for c in cards if c.get("slug") == it.get("url_key")), "")[:400])
+            break
     return items
 
 

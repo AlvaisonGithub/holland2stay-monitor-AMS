@@ -205,3 +205,42 @@ def test_dutch_status_labels():
     assert mod._parse_status(t) == 179
     assert mod._parse_price(t) is None
     assert mod._parse_area(t) == "56.8"
+
+
+def test_dom_unrecognised_statuses_raise(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    cards = [{"href": "https://www.holland2stay.com/residences/x", "slug": "x", "title": "X",
+              "text": "Some street 1, Amsterdam  Nieuw label  56 m 2"}]
+    with patch("requests.get", return_value=_resp(text=_dom_page(cards))):
+        with pytest.raises(BlockedError):
+            mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}, "currentPage": 1})
+
+
+def test_detail_page_fills_missing_rent(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    import html as _h
+    mod._DETAIL_CACHE.clear()
+    detail_txt = "James Wattstraat 77D2\nKale huur\n€ 1.025,00\nServicekosten € 335,00\nBeschikbaar vanaf 15-12-2026"
+    detail_page = ('<html><body><pre id="h2s-detail-result">'
+                   + _h.escape(json.dumps({"title": "x", "text": detail_txt})) + "</pre></body></html>")
+    cards = [{"href": "https://www.holland2stay.com/residences/james-wattstraat-77d2", "slug": "james-wattstraat-77d2",
+              "title": "James Wattstraat 77D2", "text": "James Wattstraat 77D2, Amsterdam In loting 26,2 m 2 Studio 3e verdieping Energielabel A"}]
+    calls = {"detail": 0}
+
+    def fake_get(url, params=None, **kw):
+        if "james-wattstraat" in params["url"]:
+            calls["detail"] += 1
+            return _resp(text=detail_page)
+        return _resp(text=_dom_page(cards))
+
+    with patch("requests.get", side_effect=fake_get):
+        f = mod.H2SApiFetcher()
+        out = f._dom_products({"filters": {"city": {"in": ["24"]}, "available_to_book": {"in": ["179", "336"]}}, "currentPage": 1})
+        out2 = f._dom_products({"filters": {"city": {"in": ["24"]}, "available_to_book": {"in": ["179", "336"]}}, "currentPage": 1})
+    it = out["data"]["products"]["items"][0]
+    assert it["available_to_book"] == 336
+    assert it["basic_rent"] == 1025.0
+    assert it["available_startdate"] == "2026-12-15"
+    assert it["energy_label"] == "A" and it["floor"] == "3e verdieping" and it["no_of_rooms"] == "Studio"
+    assert out2["data"]["products"]["items"][0]["basic_rent"] == 1025.0
+    assert calls["detail"] == 1  # cached the second time
