@@ -798,6 +798,9 @@ class Config:
     peak_end: str = "10:00"
     peak_start_2: str = "13:30"
     peak_end_2: str = "15:00"
+    night_interval: int = 7200
+    night_start: str = "00:00"
+    night_end: str = "07:00"
     peak_weekdays_only: bool = True
     min_interval: int = 15
     jitter_ratio: float = 0.20
@@ -984,6 +987,9 @@ def load_config() -> Config:
         peak_end=os.environ.get("PEAK_END") or "10:00",
         peak_start_2=os.environ.get("PEAK_START_2") or "13:30",
         peak_end_2=os.environ.get("PEAK_END_2") or "15:00",
+        night_interval=max(0, int(os.environ.get("NIGHT_INTERVAL") or "7200")),
+        night_start=os.environ.get("NIGHT_START") or "00:00",
+        night_end=os.environ.get("NIGHT_END") or "07:00",
         peak_weekdays_only=(os.environ.get("PEAK_WEEKDAYS_ONLY") or "true").lower() != "false",
         min_interval=max(5, int(os.environ.get("MIN_INTERVAL") or "15")),
         jitter_ratio=max(0.0, min(0.5, float(os.environ.get("JITTER_RATIO") or "0.20"))),

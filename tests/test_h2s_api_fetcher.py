@@ -30,7 +30,8 @@ def _reset(monkeypatch):
     mod.H2SApiFetcher._sticky_strategy = None
     mod.H2SApiFetcher._disabled_providers = set()
     mod.H2SApiFetcher._gql_dead_until = 0.0
-    for k in ("ZENROWS_API_KEY", "BRIGHTDATA_API_KEY", "H2S_FETCH_MODE"):
+    mod.H2SApiFetcher._premium_until = 0.0
+    for k in ("ZENROWS_API_KEY", "BRIGHTDATA_API_KEY", "H2S_FETCH_MODE", "H2S_TRY_GRAPHQL"):
         monkeypatch.delenv(k, raising=False)
     yield
     mod.H2SApiFetcher._sticky_strategy = None
@@ -46,6 +47,7 @@ def test_mode_resolution(monkeypatch):
 
 
 def test_zenrows_post_success_and_sticky(monkeypatch):
+    monkeypatch.setenv("H2S_TRY_GRAPHQL", "true")
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
     with patch("requests.post", return_value=_resp(text=json.dumps(GQL_OK))) as post:
         f = mod.H2SApiFetcher()
@@ -56,6 +58,7 @@ def test_zenrows_post_success_and_sticky(monkeypatch):
 
 
 def test_zenrows_402_disables_provider_then_brightdata(monkeypatch):
+    monkeypatch.setenv("H2S_TRY_GRAPHQL", "true")
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
     monkeypatch.setenv("BRIGHTDATA_API_KEY", "b")
 
@@ -71,6 +74,7 @@ def test_zenrows_402_disables_provider_then_brightdata(monkeypatch):
 
 
 def test_all_fail_raises_blocked(monkeypatch):
+    monkeypatch.setenv("H2S_TRY_GRAPHQL", "true")
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
     with patch("requests.post", return_value=_resp(text=CF_PAGE)), \
          patch("requests.get", return_value=_resp(422, "RESP001")):
@@ -84,6 +88,7 @@ def test_no_keys_blocked():
 
 
 def test_scraper_uses_api_fetcher_when_key_set(monkeypatch):
+    monkeypatch.setenv("H2S_TRY_GRAPHQL", "true")
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
     import scrapers.holland2stay as h2s
     from models import Listing
@@ -112,6 +117,7 @@ def test_scraper_uses_api_fetcher_when_key_set(monkeypatch):
 
 
 def test_zenrows_render_in_page_fetch(monkeypatch):
+    monkeypatch.setenv("H2S_TRY_GRAPHQL", "true")
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
     import html as _h
     page = ('<html><body><div>H2S</div><pre id="h2s-gql-result" style="display:none" data-status="200">'
@@ -145,6 +151,7 @@ _CARDS = [
 
 
 def test_dom_fallback_end_to_end(monkeypatch):
+    monkeypatch.setenv("H2S_TRY_GRAPHQL", "true")
     monkeypatch.setenv("ZENROWS_API_KEY", "k")
     import scrapers.holland2stay as h2s
     mod.H2SApiFetcher._gql_dead_until = 0.0
@@ -270,3 +277,88 @@ def test_detail_page_fills_missing_rent(monkeypatch):
     assert it["energy_label"] == "A" and it["floor"] == "3e verdieping" and it["no_of_rooms"] == "Studio"
     assert out2["data"]["products"]["items"][0]["basic_rent"] == 1025.0
     assert calls["detail"] == 1  # cached the second time
+
+
+def test_graphql_skipped_by_default(monkeypatch):
+    monkeypatch.setenv("H2S_DETAIL_MAX_PER_ROUND", "0")  # count only listing-page renders
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    seen = []
+
+    def fake_get(url, params=None, **kw):
+        seen.append(params["url"])
+        return _resp(text=_dom_page([c for c in _CARDS if "Amsterdam" in c["text"]]))
+
+    with patch("requests.post") as post, patch("requests.get", side_effect=fake_get):
+        f = mod.H2SApiFetcher()
+        assert f.fetch_gql("query { products { aggregations { attribute_code } } }") == \
+            {"data": {"products": {"aggregations": []}}}
+        f.fetch_gql("q", {"filters": {"city": {"in": ["24"]}}, "currentPage": 1})
+        post.assert_not_called()
+    assert len(seen) == 1 and "/residences?page=1" in seen[0]
+
+
+def test_render_cheap_first_then_premium_sticky(monkeypatch):
+    monkeypatch.setenv("H2S_DETAIL_MAX_PER_ROUND", "0")  # count only listing-page renders
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    calls = []
+    ok_page = _dom_page([c for c in _CARDS if "Amsterdam" in c["text"]])
+
+    def fake_get(url, params=None, **kw):
+        prem = params.get("premium_proxy") == "true"
+        calls.append("premium" if prem else "cheap")
+        if not prem:
+            assert "proxy_country" not in params
+            return _resp(422, '{"code":"RESP001"}')
+        return _resp(text=ok_page)
+
+    v = {"filters": {"city": {"in": ["24"]}}, "currentPage": 1}
+    with patch("requests.get", side_effect=fake_get):
+        f = mod.H2SApiFetcher()
+        f._dom_products(v)
+        f._dom_products(v)
+    assert calls == ["cheap", "premium", "premium"]   # premium remembered
+    assert mod.H2SApiFetcher._premium_until > 0
+
+
+def test_render_cheap_success_never_uses_premium(monkeypatch):
+    monkeypatch.setenv("H2S_DETAIL_MAX_PER_ROUND", "0")  # count only listing-page renders
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    calls = []
+
+    def fake_get(url, params=None, **kw):
+        calls.append(params.get("premium_proxy", "no"))
+        return _resp(text=_dom_page([c for c in _CARDS if "Amsterdam" in c["text"]]))
+
+    with patch("requests.get", side_effect=fake_get):
+        mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}, "currentPage": 1})
+    assert calls == ["no"]
+
+
+def test_render_cheap_cf_page_falls_back(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    pages = [_resp(text=CF_PAGE), _resp(text=_dom_page([c for c in _CARDS if "Amsterdam" in c["text"]]))]
+    with patch("requests.get", side_effect=lambda *a, **k: pages.pop(0)):
+        out = mod.H2SApiFetcher()._dom_products({"filters": {"city": {"in": ["24"]}}, "currentPage": 1})
+    assert out["data"]["products"]["items"]
+
+
+def test_detail_failure_is_cached(monkeypatch):
+    monkeypatch.setenv("ZENROWS_API_KEY", "k")
+    mod._DETAIL_CACHE.clear()
+    cards = [{"href": "https://www.holland2stay.com/residences/x-1", "slug": "x-1", "title": "X 1",
+              "text": "X 1, Amsterdam In loting 30 m 2"}]
+    calls = {"detail": 0}
+
+    def fake_get(url, params=None, **kw):
+        if params["url"].endswith("x-1"):
+            calls["detail"] += 1
+            return _resp(text="<html>broken</html>")
+        return _resp(text=_dom_page(cards))
+
+    v = {"filters": {"city": {"in": ["24"]}}, "currentPage": 1}
+    with patch("requests.get", side_effect=fake_get):
+        f = mod.H2SApiFetcher()
+        f._dom_products(v)
+        n = calls["detail"]
+        f._dom_products(v)
+    assert n >= 1 and calls["detail"] == n   # not retried next round

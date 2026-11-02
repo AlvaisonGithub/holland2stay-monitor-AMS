@@ -219,6 +219,9 @@ class H2SApiFetcher:
     _disabled_providers: set[str] = set()
     _inpage_endpoint: Optional[str] = None
     _gql_dead_until: float = 0.0
+    # Cheap (browser-only) ZenRows renders work → skip premium until this time.
+    # Premium needed → use premium until this time, then re-test cheap.
+    _premium_until: float = 0.0
 
     def __init__(self, headless: bool = True, providers: Optional[list[str]] = None):
         # headless kept for interface compatibility
@@ -293,9 +296,12 @@ class H2SApiFetcher:
         is_aggs = "aggregations" in query
         body = json.dumps({"query": query, "variables": variables}, separators=(",", ":"))
 
-        # GraphQL known unreachable → read the residences page instead
+        # H2S's rebuilt site has no public GraphQL anymore, so by default go
+        # straight to reading the residences page (H2S_TRY_GRAPHQL=true re-enables
+        # the GraphQL attempts). Also used after a GraphQL failure.
+        skip_gql = os.environ.get("H2S_TRY_GRAPHQL", "").strip().lower() != "true"
         if self._zr_key and "zenrows" not in self._disabled_providers \
-                and time.monotonic() < type(self)._gql_dead_until:
+                and (skip_gql or time.monotonic() < type(self)._gql_dead_until):
             if is_aggs:
                 return {"data": {"products": {"aggregations": []}}}
             return self._dom_products(variables)
@@ -408,29 +414,17 @@ class H2SApiFetcher:
         # longer wait before giving up.
         waits = [7000, 15000]
         for attempt, wait_ms in enumerate(waits, 1):
-            params = {
-                "apikey": self._zr_key,
-                "url": page_url,
-                "js_render": "true",
-                "premium_proxy": "true",
-                "proxy_country": self._zr_country,
-                "block_resources": "image,media,font",
-                "js_instructions": json.dumps([
-                    {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
-                    {"wait": wait_ms},
-                    {"scroll_y": 4000},
-                    {"wait": 2000},
-                    {"scroll_y": 8000},
-                    {"wait": 2000},
-                    {"evaluate": _DOM_EXTRACT_JS},
-                ]),
-            }
+            instructions = [
+                {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
+                {"wait": wait_ms},
+                {"scroll_y": 4000},
+                {"wait": 2000},
+                {"scroll_y": 8000},
+                {"wait": 2000},
+                {"evaluate": _DOM_EXTRACT_JS},
+            ]
             try:
-                resp = requests.get(self.ZENROWS_URL, params=params, timeout=150)
-            except requests.RequestException as e:
-                raise _exc("ScrapeNetworkError")(f"H2S residences page (ZenRows) network error: {e}")
-            try:
-                page = self._zenrows_check(resp)
+                page = self._render(page_url, instructions, "h2s-dom-result")
             except _ProviderDisabled as e:
                 type(self)._disabled_providers.add("zenrows")
                 raise _exc("BlockedError")(f"H2S residences page: {e}")
@@ -502,6 +496,61 @@ class H2SApiFetcher:
             "items": items,
         }}}
 
+    _PREMIUM_STICKY = 6 * 3600
+
+    def _render(self, url: str, js_instructions: list, marker: str, timeout: int = 150) -> str:
+        """
+        Load ``url`` in ZenRows' browser and return the HTML.
+
+        Tries the cheap browser-only mode first (no premium proxy). If
+        Cloudflare blocks it, retries with the premium residential proxy and
+        keeps using premium for 6h before re-testing the cheap mode.
+        ``marker`` is the id of the element our JS writes; its absence means
+        the page didn't load properly.
+        """
+        import requests
+
+        cls = type(self)
+        modes = ["premium"] if time.monotonic() < cls._premium_until else ["cheap", "premium"]
+        last_err = ""
+        for mode in modes:
+            params = {
+                "apikey": self._zr_key,
+                "url": url,
+                "js_render": "true",
+                "block_resources": "image,media,font",
+                "js_instructions": json.dumps(js_instructions),
+            }
+            if mode == "premium":
+                params["premium_proxy"] = "true"
+                params["proxy_country"] = self._zr_country
+            try:
+                resp = requests.get(self.ZENROWS_URL, params=params, timeout=timeout)
+            except requests.RequestException as e:
+                raise _exc("ScrapeNetworkError")(f"ZenRows network error for {url}: {e}")
+            try:
+                page = self._zenrows_check(resp)
+            except _StrategyFailed as e:
+                last_err = str(e)
+                if mode == "cheap":
+                    logger.info("H2S cheap render failed (%s) — retrying with premium proxy", last_err[:150])
+                    continue
+                raise
+            if f'id="{marker}"' not in page:
+                last_err = "CF challenge page" if _looks_like_cf_challenge(page) else f"{marker} missing ({len(page)} chars)"
+                if mode == "cheap":
+                    logger.info("H2S cheap render incomplete (%s) — retrying with premium proxy", last_err)
+                    continue
+                return page  # caller reports the precise problem
+            if mode == "premium" and "cheap" in modes:
+                cls._premium_until = time.monotonic() + self._PREMIUM_STICKY
+                logger.info("H2S: premium proxy needed — using it for the next %dh", self._PREMIUM_STICKY // 3600)
+            elif mode == "cheap" and cls._premium_until:
+                logger.info("H2S: cheap render works again — premium proxy no longer used")
+                cls._premium_until = 0.0
+            return page
+        raise _StrategyFailed(last_err or "render failed")
+
     def _enrich_from_detail_pages(self, items: list[dict]) -> None:
         """Fill missing rent / start date from each residence's own page (cached 24h)."""
         try:
@@ -525,6 +574,8 @@ class H2SApiFetcher:
                     rent, date = self._fetch_detail(url)
                 except Exception as e:  # noqa: BLE001 — enrichment must never break the scan
                     logger.warning("H2S detail page failed for %s: %s", url, e)
+                    # remember the failure so we don't pay for it every round
+                    _DETAIL_CACHE[url] = (now - _DETAIL_TTL + _DETAIL_FAIL_RETRY, None, None)
                     continue
                 cached = (now, rent, date)
                 _DETAIL_CACHE[url] = cached
@@ -535,23 +586,12 @@ class H2SApiFetcher:
                 it["available_startdate"] = date
 
     def _fetch_detail(self, url: str) -> tuple[Optional[float], Optional[str]]:
-        import requests
-        params = {
-            "apikey": self._zr_key,
-            "url": url,
-            "js_render": "true",
-            "premium_proxy": "true",
-            "proxy_country": self._zr_country,
-            "block_resources": "image,media,font",
-            "js_instructions": json.dumps([
-                {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
-                {"wait": 4000},
-                {"evaluate": _DETAIL_JS},
-            ]),
-        }
         start = time.monotonic()
-        resp = requests.get(self.ZENROWS_URL, params=params, timeout=120)
-        page = self._zenrows_check(resp)
+        page = self._render(url, [
+            {"wait_for": "link[href*='/_next/'], script[src*='/_next/']"},
+            {"wait": 4000},
+            {"evaluate": _DETAIL_JS},
+        ], "h2s-detail-result", timeout=120)
         m = re.search(r'<pre[^>]*id="h2s-detail-result"[^>]*>(.*?)</pre>', page, re.S)
         if not m:
             raise _StrategyFailed("detail extractor output missing")
@@ -826,7 +866,8 @@ def _parse_card_features(text: str) -> dict:
 
 # Rent / date from a residence's own page, keyed by url → (time, rent, date)
 _DETAIL_CACHE: dict[str, tuple[float, Optional[float], Optional[str]]] = {}
-_DETAIL_TTL = 24 * 3600
+_DETAIL_TTL = 72 * 3600          # rent/date rarely change
+_DETAIL_FAIL_RETRY = 6 * 3600    # after a failed lookup, wait this long before paying again
 
 _DETAIL_JS = r"""
 (function(){
