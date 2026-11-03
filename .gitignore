@@ -95,3 +95,11 @@ google-services.json.enc
 *.hprof
 *.trace
 _to_delete/
+
+# Local virtualenvs (never commit)
+.venv/
+.venv-*/
+venv/
+
+# AI assistant notes (personal, local only)
+.workbuddy-ai/
