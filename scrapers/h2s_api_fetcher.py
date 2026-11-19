@@ -232,6 +232,7 @@ class H2SApiFetcher:
         self._bd_country = os.environ.get("BRIGHTDATA_COUNTRY", "").strip() or "nl"
         self._providers = providers or ["zenrows", "brightdata"]
         self._initialized = False
+        self._codomo = None  # scrapers.codomo.CodomoFetcher, created lazily
 
     # ── interface compat ─────────────────────────────────────────────
     def __enter__(self) -> "H2SApiFetcher":
@@ -244,6 +245,10 @@ class H2SApiFetcher:
         pass
 
     def ensure_initialized(self) -> None:
+        if _use_codomo():
+            # Codomo pages are fetched directly (no API key needed); keys are optional fallbacks
+            self._initialized = True
+            return
         if not self._strategies():
             raise _exc("BlockedError")(
                 "H2S API fetcher: no usable provider (set ZENROWS_API_KEY or "
@@ -294,6 +299,16 @@ class H2SApiFetcher:
     ) -> dict:
         variables = variables or {}
         is_aggs = "aggregations" in query
+
+        # Holland2Stay is now Codomo (codomo.eu): read its search page
+        if _use_codomo():
+            if is_aggs:
+                return {"data": {"products": {"aggregations": []}}}
+            from . import codomo
+            if self._codomo is None:
+                self._codomo = codomo.CodomoFetcher()
+            return codomo.products_for(variables, self._codomo)
+
         body = json.dumps({"query": query, "variables": variables}, separators=(",", ":"))
 
         # H2S's rebuilt site has no public GraphQL anymore, so by default go
@@ -957,8 +972,18 @@ def _cards_to_items(cards: list[dict], city_ids: list[str], avail_ids: set[int])
     return items
 
 
+def _use_codomo() -> bool:
+    """
+    True (default) → Holland2Stay listings come from codomo.eu.
+    H2S_SITE=legacy → old holland2stay.com page/GraphQL code paths.
+    """
+    return (os.environ.get("H2S_SITE", "codomo") or "codomo").strip().lower() != "legacy"
+
+
 def resolve_h2s_fetch_mode() -> str:
     """Return the effective H2S fetch mode: 'api' or 'browser'."""
+    if _use_codomo():
+        return "api"  # plain HTTP; CloakBrowser is not needed for codomo.eu
     mode = (os.environ.get("H2S_FETCH_MODE", "auto") or "auto").strip().lower()
     if mode == "browser":
         return "browser"

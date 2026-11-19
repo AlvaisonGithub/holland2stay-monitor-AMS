@@ -1,6 +1,6 @@
 # FlatRadar: Amsterdam fork
 
-A self-hosted monitor for Dutch student and starter rental platforms. It watches **Holland2Stay**, **OurDomain** and **Xior**, and sends you a Telegram message (or email, web or push notification) as soon as a home becomes available to book or enters a lottery.
+A self-hosted monitor for Dutch student and starter rental platforms. It watches **Holland2Stay** (now **Codomo**), **OurDomain** and **Xior**, and sends you a Telegram message (or email, web or push notification) as soon as a home becomes available to book or enters a lottery.
 
 This repository is a fork of [**FlatRadar** by 751K](https://github.com/751K/holland2stay-monitor). It keeps the original app and adds what was needed to make monitoring work again from a cloud server in late 2026, after Holland2Stay rebuilt its website and the platforms started blocking cloud-server traffic.
 
@@ -20,7 +20,18 @@ The full original documentation is kept in [`docs/README.md`](docs/README.md) ([
 
 ## What's new in this fork
 
-### Holland2Stay monitoring restored
+### Holland2Stay → Codomo (November 2026)
+Holland2Stay now lives at **[codomo.eu](https://codomo.eu/homes/nl/en)**. Its search page (`/homes/nl/en?city=Amsterdam&page=N`, 25 homes per page) is server-rendered and currently not behind a Cloudflare challenge, so this fork reads it **with a plain HTTP request: no browser, and usually no ZenRows credits.**
+
+- Every home's address, link, type, area, persons, furnishing, floor, building, available-from date, **rent** and service costs come straight from the search page.
+- Booking action → status: **"Book directly"** → *Available to book*; **"Show interest"** → *Available in lottery* (the notification also shows how many people registered interest).
+- Handles both page layouts Codomo serves (content inline, or streamed in hidden blocks with placeholders).
+- Same safety checks as before: a page from the wrong city, unreadable cards or unknown booking labels count as a failed scan, never as "0 homes".
+- If a direct request is ever blocked, it falls back to ZenRows (plain fetch first, then premium proxy) or Bright Data, if a key is set.
+- Unit IDs keep the same format as on the old site, so homes already in your database are recognised.
+- The old holland2stay.com code is still included; `H2S_SITE=legacy` switches back to it.
+
+### Holland2Stay monitoring restored (old site, early November 2026)
 Holland2Stay rebuilt its site (and announced a rename to **Codomo**). The public GraphQL API the original scraper relied on is gone, and the site sits behind a Cloudflare check that the built-in browser (CloakBrowser) no longer passes from cloud servers.
 
 - **Reads the residences page directly** through [ZenRows](https://www.zenrows.com/)' rendering browser, using the new city filter (`?city[filter]=Amsterdam,24`) and following pagination.
@@ -79,7 +90,7 @@ Each user in the dashboard has their own filters (city, max rent, area, type, en
 | | Notes |
 |---|---|
 | **A server that runs 24/7** | [Railway](https://railway.com) (easiest, used for this fork), any VPS with Docker (≥ 1 GB RAM), or your own computer |
-| **A ZenRows account** | Required for Holland2Stay and OurDomain on a cloud server. Get an API key at [app.zenrows.com](https://app.zenrows.com). See [Credit usage](#credit-usage) for what it costs. |
+| **A ZenRows account** | Required for OurDomain on a cloud server; optional backup for Holland2Stay/Codomo. Get an API key at [app.zenrows.com](https://app.zenrows.com). See [Credit usage](#credit-usage) for what it costs. |
 | **A Telegram bot** (recommended) | Create one with [@BotFather](https://t.me/BotFather) to get alerts on your phone |
 | Bright Data account | Optional alternative or backup provider |
 
@@ -112,7 +123,7 @@ python -c "import secrets; print(secrets.token_hex(32))"                        
 | `DATA_ENCRYPTION_KEY` | from step 4 | Encrypts stored tokens and passwords |
 | `FLASK_SECRET` | from step 4 | Keeps logins valid across restarts |
 | `SESSION_COOKIE_SECURE` | `true` | Railway serves over HTTPS |
-| `ZENROWS_API_KEY` | your key | Holland2Stay and OurDomain |
+| `ZENROWS_API_KEY` | your key | OurDomain (and backup for Holland2Stay/Codomo) |
 | `SOURCES` | `holland2stay,ourdomain,xior` | Which platforms to monitor |
 | `CITIES` | `Amsterdam,24` | Holland2Stay cities as `Name,ID`, separated by `\|`. IDs are in `KNOWN_CITIES` in [`config.py`](config.py). |
 | `OURDOMAIN_CITIES` | `Amsterdam Diemen,diemen\|Amsterdam South-East,south-east` | OurDomain locations |
@@ -161,6 +172,7 @@ Global settings live in environment variables (Railway Variables or `.env`); eve
 | `ZENROWS_API_KEY` | – | ZenRows key; enables the cloud scraping path |
 | `ZENROWS_COUNTRY` | `nl` | Country for the premium proxy |
 | `BRIGHTDATA_API_KEY` / `BRIGHTDATA_ZONE` | – / `web_unlocker1` | Optional Bright Data provider |
+| `H2S_SITE` | `codomo` | `codomo` reads codomo.eu; `legacy` uses the old holland2stay.com code |
 | `H2S_FETCH_MODE` | `auto` | `auto` (API if a key is set, else browser), `zenrows`, `brightdata` or `browser` |
 | `H2S_DETAIL_MAX_PER_ROUND` | `5` | Maximum listing pages opened per round to fetch rent and dates |
 | `H2S_TRY_GRAPHQL` | `false` | Re-enable the old GraphQL attempts |
@@ -174,7 +186,7 @@ Global settings live in environment variables (Railway Variables or `.env`); eve
 
 ## Credit usage
 
-Most ZenRows cost comes from Holland2Stay, because each page is rendered in a real browser. Roughly:
+Since the move to Codomo, Holland2Stay is normally read with free direct requests, so most ZenRows cost now comes from OurDomain. The notes below apply when Holland2Stay falls back to ZenRows or `H2S_SITE=legacy` is used:
 
 - **Per round:** one rendered page per Holland2Stay city page (about 10 listings per page), plus small requests for OurDomain.
 - **Per new listing:** one extra rendered page to read its rent and date, cached for 72 hours.
@@ -188,6 +200,9 @@ Check your real usage in the ZenRows dashboard after a day and adjust.
 
 | Log message | Meaning |
 |---|---|
+| `Codomo Amsterdam page 1/1 (…): N homes, M match` | Working (Codomo). `M` = homes you get alerts for. |
+| `Codomo: fetching via zenrows` | Direct requests were blocked; using ZenRows as a fallback. |
+| `Codomo city filter not applied` / `no booking action recognised` | Codomo changed its page; the scraper needs an update. |
 | `H2S page 1/N read … M match` | Working. `M` = listings that are available to book or in lottery. |
 | `listings not rendered yet … retrying` | Slow page load, retried automatically. Fine if occasional. |
 | `H2S 本轮跳过（页面未渲染完成），下轮重试` | Both tries were too slow; skipped this round only. If it happens most rounds, open an issue. |

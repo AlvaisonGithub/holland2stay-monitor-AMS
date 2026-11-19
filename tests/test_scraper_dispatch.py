@@ -100,6 +100,7 @@ def test_holland2stay_reuses_one_browser_for_all_cities(monkeypatch):
     回归保护：P0 重构曾导致每个城市新建一个 Session；迁移到 CloakBrowser
     后 batch_session 应确保一个浏览器实例服务于批次内所有城市。
     """
+    monkeypatch.setenv("H2S_SITE", "legacy")  # covers the old holland2stay.com browser path
     browser_instances = []
 
     class _FakeBrowserFetcher:
@@ -136,6 +137,7 @@ def test_holland2stay_reuses_one_browser_for_all_cities(monkeypatch):
 
 def test_holland2stay_standalone_scrape_still_self_manages_browser(monkeypatch):
     """不经 dispatcher 直接 scrape() 时，应自建 BrowserFetcher（单测路径）。"""
+    monkeypatch.setenv("H2S_SITE", "legacy")  # covers the old holland2stay.com browser path
     browser_instances = []
 
     class _FakeBrowserFetcher:

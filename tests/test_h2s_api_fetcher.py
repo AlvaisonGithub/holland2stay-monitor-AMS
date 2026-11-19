@@ -31,6 +31,7 @@ def _reset(monkeypatch):
     mod.H2SApiFetcher._disabled_providers = set()
     mod.H2SApiFetcher._gql_dead_until = 0.0
     mod.H2SApiFetcher._premium_until = 0.0
+    monkeypatch.setenv("H2S_SITE", "legacy")  # these tests cover the old holland2stay.com paths
     for k in ("ZENROWS_API_KEY", "BRIGHTDATA_API_KEY", "H2S_FETCH_MODE", "H2S_TRY_GRAPHQL"):
         monkeypatch.delenv(k, raising=False)
     yield
